@@ -11,10 +11,21 @@ echo "=== 1. Обновление системы ==="
 apt update && apt upgrade -y
 
 echo "=== 2. Настройка SSH-ключа для root ==="
-# Создаём директорию .ssh для root с правильными правами
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
-read -p "Вставьте публичный SSH-ключ для доступа к root: " ROOT_SSH_KEY
+
+# Проверяем, что ключ не пустой и имеет правильный формат
+while true; do
+    read -p "Вставьте публичный SSH-ключ для доступа к root (например, ssh-ed25519 AAAA...): " ROOT_SSH_KEY
+    if [[ -z "$ROOT_SSH_KEY" ]]; then
+        echo "Ошибка: ключ не может быть пустым. Попробуйте снова."
+    elif [[ ! "$ROOT_SSH_KEY" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp) ]]; then
+        echo "Ошибка: ключ должен начинаться с ssh-rsa, ssh-ed25519 или ecdsa-..."
+    else
+        break
+    fi
+done
+
 echo "$ROOT_SSH_KEY" > /root/.ssh/authorized_keys
 chmod 600 /root/.ssh/authorized_keys
 echo "SSH-ключ для root сохранён."
@@ -24,14 +35,18 @@ SSH_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
 cp /etc/ssh/sshd_config "$SSH_BACKUP"
 echo "Резервная копия сохранена в $SSH_BACKUP"
 
-read -p "Новый порт SSH (по умолчанию 22): " SSH_PORT
-SSH_PORT=${SSH_PORT:-22}
-if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [ "$SSH_PORT" -lt 1 ] || [ "$SSH_PORT" -gt 65535 ]; then
-    echo "Некорректный порт, используется 22."
-    SSH_PORT=22
-fi
+# Запрос порта с проверкой
+while true; do
+    read -p "Новый порт SSH (по умолчанию 22): " SSH_PORT
+    SSH_PORT=${SSH_PORT:-22}
+    if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then
+        break
+    else
+        echo "Некорректный порт. Введите число от 1 до 65535."
+    fi
+done
 
-# Смена порта снижает количество автоматических атак (сканеры обычно ломятся на 22)
+# Смена порта снижает количество автоматических атак
 sed -i "s/^#*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
 grep -q "^Port " /etc/ssh/sshd_config || echo "Port $SSH_PORT" >> /etc/ssh/sshd_config
 
@@ -39,27 +54,24 @@ grep -q "^Port " /etc/ssh/sshd_config || echo "Port $SSH_PORT" >> /etc/ssh/sshd_
 sed -i 's/^#*PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 grep -q "^PermitRootLogin " /etc/ssh/sshd_config || echo "PermitRootLogin prohibit-password" >> /etc/ssh/sshd_config
 
-# Отключаем вход по паролю для всех (только ключи) — защита от брутфорса паролей
+# Отключаем вход по паролю для всех (только ключи) — защита от брутфорса
 sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
 grep -q "^PasswordAuthentication " /etc/ssh/sshd_config || echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
 
-# Явно включаем аутентификацию по ключам (на случай если ранее было выключено)
+# Явно включаем аутентификацию по ключам
 sed -i 's/^#*PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 grep -q "^PubkeyAuthentication " /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
 
-# Отключаем форвардинг X11 — редко нужно, увеличивает атакуемую поверхность
+# Отключаем неиспользуемые опции
 sed -i 's/^#*X11Forwarding .*/X11Forwarding no/' /etc/ssh/sshd_config
 grep -q "^X11Forwarding " /etc/ssh/sshd_config || echo "X11Forwarding no" >> /etc/ssh/sshd_config
 
-# Лимит попыток — после 3 неудач соединение рвётся, затрудняет перебор
 sed -i 's/^#*MaxAuthTries .*/MaxAuthTries 3/' /etc/ssh/sshd_config
 grep -q "^MaxAuthTries " /etc/ssh/sshd_config || echo "MaxAuthTries 3" >> /etc/ssh/sshd_config
 
-# Запрет пустых паролей — очевидно, но на всякий случай
 sed -i 's/^#*PermitEmptyPasswords .*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
 grep -q "^PermitEmptyPasswords " /etc/ssh/sshd_config || echo "PermitEmptyPasswords no" >> /etc/ssh/sshd_config
 
-# Отключаем challenge-response — лишний вектор аутентификации
 sed -i 's/^#*ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
 grep -q "^ChallengeResponseAuthentication " /etc/ssh/sshd_config || echo "ChallengeResponseAuthentication no" >> /etc/ssh/sshd_config
 
@@ -71,13 +83,13 @@ if ! sshd -t; then
     exit 1
 fi
 
-# Определяем имя сервиса (в разных дистрибутивах может быть sshd или ssh)
-if systemctl list-unit-files | grep -q '^sshd\.service'; then
-    SSH_SERVICE="sshd"
-elif systemctl list-unit-files | grep -q '^ssh\.service'; then
+# Определяем имя сервиса: в Debian/Ubuntu обычно ssh, но проверим оба варианта
+if systemctl list-units --type=service --all | grep -q 'ssh\.service'; then
     SSH_SERVICE="ssh"
+elif systemctl list-units --type=service --all | grep -q 'sshd\.service'; then
+    SSH_SERVICE="sshd"
 else
-    echo "Не удалось найти SSH-сервис. Перезапустите вручную."
+    echo "Не удалось найти SSH-сервис. Перезапустите вручную командой: systemctl restart ssh"
     exit 1
 fi
 
@@ -89,7 +101,7 @@ CURRENT_FORWARD=$(sysctl -n net.ipv4.ip_forward)
 if [ "$CURRENT_FORWARD" -eq 1 ]; then
     echo "IP-форвардинг уже включён."
 else
-    # Без форвардинга VPN-клиенты не смогут выходить в интернет через сервер
+    # Без форвардинга VPN-клиенты не смогут выходить в интернет
     read -p "IP-форвардинг выключен. Включить (нужно для выхода клиентов VPN в интернет)? [y/N]: " FW_CHOICE
     if [[ "$FW_CHOICE" =~ ^[Yy]$ ]]; then
         sysctl -w net.ipv4.ip_forward=1
@@ -121,7 +133,7 @@ done
 echo "=== 6. Установка и настройка fail2ban ==="
 apt install -y fail2ban
 
-# Автоматическая блокировка IP после 3 неудачных попыток за 10 минут
+# Автоблокировка IP после 3 неудачных попыток за 10 минут
 cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 banaction = nftables-allports
