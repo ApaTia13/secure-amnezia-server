@@ -10,36 +10,14 @@ fi
 echo "=== 1. Обновление системы ==="
 apt update && apt upgrade -y
 
-echo "=== 2. Создание пользователя ==="
-read -p "Имя нового пользователя: " NEW_USER
-if id "$NEW_USER" &>/dev/null; then
-    echo "Пользователь $NEW_USER уже существует. Выход."
-    exit 1
-fi
-
-# Пароль не должен светиться в истории терминала и на экране
-read -s -p "Пароль для $NEW_USER: " USER_PASS
-echo
-read -s -p "Подтверждение пароля: " USER_PASS_CONFIRM
-echo
-if [[ "$USER_PASS" != "$USER_PASS_CONFIRM" ]]; then
-    echo "Пароли не совпадают. Выход."
-    exit 1
-fi
-
-# -m создаёт /home, -G sudo даёт админские привилегии
-useradd -m -s /bin/bash -G sudo "$NEW_USER"
-echo "$NEW_USER:$USER_PASS" | chpasswd
-
-# SSH-ключ — вход без пароля по сети, безопаснее чем пароль
-mkdir -p /home/$NEW_USER/.ssh
-chmod 700 /home/$NEW_USER/.ssh
-read -p "Вставьте публичный SSH-ключ для $NEW_USER: " SSH_KEY
-echo "$SSH_KEY" > /home/$NEW_USER/.ssh/authorized_keys
-chmod 600 /home/$NEW_USER/.ssh/authorized_keys
-chown -R $NEW_USER:$NEW_USER /home/$NEW_USER/.ssh
-
-echo "Пользователь $NEW_USER создан (с sudo и SSH-ключом)."
+echo "=== 2. Настройка SSH-ключа для root ==="
+# Создаём директорию .ssh для root с правильными правами
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+read -p "Вставьте публичный SSH-ключ для доступа к root: " ROOT_SSH_KEY
+echo "$ROOT_SSH_KEY" > /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+echo "SSH-ключ для root сохранён."
 
 echo "=== 3. Настройка SSH ==="
 SSH_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
@@ -53,57 +31,47 @@ if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [ "$SSH_PORT" -lt 1 ] || [ "$SSH_PORT" -gt
     SSH_PORT=22
 fi
 
-# Смена порта снижает количество автоматических атак (сканеры обычно ломятся на 22)
+# Смена порта снижает количество автоматических атак
 sed -i "s/^#*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
 grep -q "^Port " /etc/ssh/sshd_config || echo "Port $SSH_PORT" >> /etc/ssh/sshd_config
 
-# Запрет root по SSH — даже если подберут пароль, не смогут войти напрямую
-sed -i 's/^#*PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
-grep -q "^PermitRootLogin " /etc/ssh/sshd_config || echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+# Разрешаем root-доступ только по ключу (пароль запрещён)
+sed -i 's/^#*PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+grep -q "^PermitRootLogin " /etc/ssh/sshd_config || echo "PermitRootLogin prohibit-password" >> /etc/ssh/sshd_config
 
-# Отключаем вход по паролю (только ключи) — защита от брутфорса паролей
+# Отключаем вход по паролю для всех (только ключи)
 sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
 grep -q "^PasswordAuthentication " /etc/ssh/sshd_config || echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
 
-# Явно включаем ключи (на случай если ранее было выключено)
+# Явно включаем аутентификацию по ключам
 sed -i 's/^#*PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 grep -q "^PubkeyAuthentication " /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
 
-# Отключаем форвардинг X11 — редко нужно, увеличивает атакуемую поверхность
+# Отключаем неиспользуемые и потенциально опасные опции
 sed -i 's/^#*X11Forwarding .*/X11Forwarding no/' /etc/ssh/sshd_config
 grep -q "^X11Forwarding " /etc/ssh/sshd_config || echo "X11Forwarding no" >> /etc/ssh/sshd_config
 
-# Лимит попыток — после 3 неудач соединение рвётся, затрудняет перебор
+# Лимит попыток — после 3 неудач соединение рвётся
 sed -i 's/^#*MaxAuthTries .*/MaxAuthTries 3/' /etc/ssh/sshd_config
 grep -q "^MaxAuthTries " /etc/ssh/sshd_config || echo "MaxAuthTries 3" >> /etc/ssh/sshd_config
 
-# Отключаем пустые пароли — очевидно, но на всякий случай
+# Запрет пустых паролей
 sed -i 's/^#*PermitEmptyPasswords .*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
 grep -q "^PermitEmptyPasswords " /etc/ssh/sshd_config || echo "PermitEmptyPasswords no" >> /etc/ssh/sshd_config
 
-# Отключаем challenge-response — лишний вектор аутентификации
+# Отключаем challenge-response
 sed -i 's/^#*ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
 grep -q "^ChallengeResponseAuthentication " /etc/ssh/sshd_config || echo "ChallengeResponseAuthentication no" >> /etc/ssh/sshd_config
 
-# Двухфакторка для созданного пользователя: ключ И пароль.
-# Даже если ключ украдут — нужен ещё пароль, и наоборот.
-sed -i "/^Match User $NEW_USER/,/^Match/d" /etc/ssh/sshd_config
-cat >> /etc/ssh/sshd_config <<EOF
-
-Match User $NEW_USER
-    PasswordAuthentication yes
-    AuthenticationMethods publickey,password
-EOF
-
 systemctl restart sshd
-echo "SSH перезапущен: порт $SSH_PORT, root-вход запрещён, для $NEW_USER обязательны ключ+пароль."
+echo "SSH перезапущен: порт $SSH_PORT, вход для root только по ключу, пароль отключён."
 
 echo "=== 4. IP-форвардинг ==="
 CURRENT_FORWARD=$(sysctl -n net.ipv4.ip_forward)
 if [ "$CURRENT_FORWARD" -eq 1 ]; then
     echo "IP-форвардинг уже включён."
 else
-    # Без форвардинга VPN-клиенты не смогут выходить в интернет через сервер
+    # Без форвардинга VPN-клиенты не смогут выходить в интернет
     read -p "IP-форвардинг выключен. Включить (нужно для выхода клиентов VPN в интернет)? [y/N]: " FW_CHOICE
     if [[ "$FW_CHOICE" =~ ^[Yy]$ ]]; then
         sysctl -w net.ipv4.ip_forward=1
@@ -113,7 +81,7 @@ else
 fi
 
 echo "=== 5. Отключение неиспользуемых сервисов ==="
-# Чем меньше работающих сервисов, тем меньше потенциальных уязвимостей
+# Уменьшаем поверхность атаки
 SERVICES_TO_DISABLE=(
     cups cups-browsed
     avahi-daemon
@@ -135,7 +103,7 @@ done
 echo "=== 6. Установка и настройка fail2ban ==="
 apt install -y fail2ban
 
-# Автоматическая блокировка IP после 3 неудачных попыток за 10 минут
+# Автоблокировка IP после 3 неудачных попыток за 10 минут
 cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 banaction = nftables-allports
@@ -154,7 +122,7 @@ systemctl restart fail2ban
 echo "fail2ban настроен для защиты SSH на порту $SSH_PORT."
 
 echo "=== 7. Настройка файервола nftables ==="
-# AmneziaVPN может слушать на нескольких UDP-портах одновременно (например, 443 и 8443)
+# AmneziaVPN может слушать на нескольких UDP-портах
 read -p "Порты AmneziaVPN (UDP, через запятую, напр. 443,8443): " AMNEZIA_PORTS_RAW
 IFS=',' read -ra AMNEZIA_PORTS <<< "$AMNEZIA_PORTS_RAW"
 for port in "${AMNEZIA_PORTS[@]}"; do
@@ -166,7 +134,7 @@ for port in "${AMNEZIA_PORTS[@]}"; do
 done
 
 apt install -y nftables
-# Сохраняем старые правила на случай, если новые заблокируют доступ
+# Резервное копирование старых правил на случай ошибки
 nft list ruleset > /etc/nftables-backup-$(date +%Y%m%d%H%M%S).nft 2>/dev/null || true
 
 NFT_FILE="/etc/nftables.conf"
@@ -179,10 +147,10 @@ table inet filter {
     chain input {
         type filter hook input priority 0; policy drop;   # Всё, что не разрешено, запрещено
 
-        iif lo accept                     # loopback всегда доверяем
-        ct state established,related accept   # Пускаем ответы на исходящие запросы
+        iif lo accept
+        ct state established,related accept
 
-        tcp dport $SSH_PORT accept        # Нестандартный порт SSH (меньше сканеров)
+        tcp dport $SSH_PORT accept
 EOF
 
 # Добавляем все указанные UDP-порты для AmneziaVPN
@@ -193,15 +161,15 @@ done
 cat >> "$NFT_FILE" <<EOF
 
         ip protocol icmp accept
-        ip6 nexthdr icmpv6 accept         # ping полезен для диагностики
+        ip6 nexthdr icmpv6 accept
     }
 
     chain forward {
-        type filter hook forward priority 0; policy drop;   # Маршрутизация запрещена по умолчанию
+        type filter hook forward priority 0; policy drop;
     }
 
     chain output {
-        type filter hook output priority 0; policy accept;  # Исходящее разрешено
+        type filter hook output priority 0; policy accept;
     }
 }
 EOF
@@ -211,7 +179,8 @@ systemctl enable nftables
 echo "Файервол применён. Открыты: порт SSH $SSH_PORT/TCP, Amnezia порты ${AMNEZIA_PORTS[*]}/UDP, ICMP."
 
 echo "=== Готово ==="
-echo "Пользователь $NEW_USER создан. Для SSH обязателен ключ + пароль."
-echo "⚠️ ВАЖНО: Прежде чем закрыть текущую сессию, откройте новое окно терминала и проверьте подключение по SSH на порт $SSH_PORT."
-echo "Если подключение не удаётся, откатите конфиг SSH командой:"
+echo "Доступ к серверу только по SSH-ключу для root на порту $SSH_PORT."
+echo "⚠️ ВАЖНО: Прежде чем закрыть текущую сессию, откройте новое окно терминала и проверьте подключение:"
+echo "  ssh -p $SSH_PORT -i путь_до_ключа root@<IP_сервера>"
+echo "Если подключение не удаётся, откатите конфиг SSH:"
 echo "  cp $SSH_BACKUP /etc/ssh/sshd_config && systemctl restart sshd"
