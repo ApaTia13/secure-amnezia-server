@@ -28,44 +28,31 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # =====================================================
-# Функция: показать UDP-порты из Docker-контейнеров
+# Функция: показать UDP-порты из контейнеров Amnezia
 # =====================================================
-show_docker_udp_ports() {
+show_amnezia_ports() {
     if command -v docker &>/dev/null && docker ps --format "table" &>/dev/null; then
-        local containers=$(docker ps --format "{{.Names}}\t{{.Ports}}")
+        local containers=$(docker ps --filter "name=amnezia" --format "{{.Names}}\t{{.Ports}}" 2>/dev/null)
         if [[ -n "$containers" ]]; then
-            echo -e "\n${CYAN}📦 Текущие UDP-порты Docker-контейнеров:${NC}"
+            echo -e "\n${CYAN}📦 Найдены контейнеры AmneziaVPN:${NC}"
             echo "$containers" | while IFS=$'\t' read -r name ports; do
-                # Ищем UDP-порты в формате 0.0.0.0:xxxx->xxxx/udp или [::]:xxxx->xxxx/udp
                 local udp_ports=$(echo "$ports" | grep -oP '0\.0\.0\.0:\K[0-9]+(?=->[0-9]+/udp)' || true)
                 if [[ -n "$udp_ports" ]]; then
                     echo "   • ${name}: ${udp_ports}/udp"
                 fi
             done
         else
-            warn "Нет запущенных Docker-контейнеров"
+            warn "Контейнеры AmneziaVPN не обнаружены. Убедитесь, что VPN установлена."
         fi
     else
-        warn "Docker не установлен или недоступен"
+        warn "Docker не установлен или недоступен. Установите Docker перед запуском этого скрипта."
     fi
 }
 
 # =====================================================
-# 1. Обновление системы
+# 1. Настройка SSH-ключа для root
 # =====================================================
-title "1. ОБНОВЛЕНИЕ СИСТЕМЫ"
-info "Обновление списка пакетов и установка обновлений..."
-if apt update && apt upgrade -y; then
-    ok "Система обновлена"
-else
-    err "Ошибка при обновлении системы"
-    exit 1
-fi
-
-# =====================================================
-# 2. Настройка SSH-ключа для root
-# =====================================================
-title "2. НАСТРОЙКА SSH-КЛЮЧА ДЛЯ ROOT"
+title "1. НАСТРОЙКА SSH-КЛЮЧА ДЛЯ ROOT"
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
 
@@ -85,16 +72,14 @@ chmod 600 /root/.ssh/authorized_keys
 ok "SSH-ключ сохранён в /root/.ssh/authorized_keys"
 
 # =====================================================
-# 3. Настройка SSH (порт, запрет пароля, отключение сокета)
+# 2. Настройка SSH (порт, запрет пароля, отключение сокета)
 # =====================================================
-title "3. НАСТРОЙКА SSH-СЕРВЕРА"
+title "2. НАСТРОЙКА SSH-СЕРВЕРА"
 
-# Резервная копия (старые не удаляем)
 SSH_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
 cp /etc/ssh/sshd_config "$SSH_BACKUP"
 ok "Резервная копия конфига SSH: $SSH_BACKUP"
 
-# Запрос порта
 while true; do
     read -p "Новый порт SSH (по умолчанию 22): " SSH_PORT
     SSH_PORT=${SSH_PORT:-22}
@@ -105,7 +90,6 @@ while true; do
     fi
 done
 
-# Применяем настройки
 info "Устанавливаем порт $SSH_PORT..."
 sed -i "s/^#*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
 grep -q "^Port " /etc/ssh/sshd_config || echo "Port $SSH_PORT" >> /etc/ssh/sshd_config
@@ -122,7 +106,6 @@ info "Включаем аутентификацию по ключам..."
 sed -i 's/^#*PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 grep -q "^PubkeyAuthentication " /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
 
-# Дополнительные параметры безопасности
 info "Применяем дополнительные параметры безопасности..."
 sed -i 's/^#*X11Forwarding .*/X11Forwarding no/' /etc/ssh/sshd_config
 grep -q "^X11Forwarding " /etc/ssh/sshd_config || echo "X11Forwarding no" >> /etc/ssh/sshd_config
@@ -136,7 +119,6 @@ grep -q "^PermitEmptyPasswords " /etc/ssh/sshd_config || echo "PermitEmptyPasswo
 sed -i 's/^#*ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
 grep -q "^ChallengeResponseAuthentication " /etc/ssh/sshd_config || echo "ChallengeResponseAuthentication no" >> /etc/ssh/sshd_config
 
-# Проверка конфига
 info "Проверка конфигурации SSH..."
 if ! sshd -t; then
     err "Ошибка в конфигурации SSH! Откат к резервной копии."
@@ -145,7 +127,6 @@ if ! sshd -t; then
 fi
 ok "Конфигурация валидна"
 
-# Отключаем сокет-активацию
 info "Отключаем ssh.socket (если активен)..."
 if systemctl is-active ssh.socket >/dev/null 2>&1; then
     systemctl stop ssh.socket
@@ -155,12 +136,10 @@ else
     ok "ssh.socket не активен, пропускаем"
 fi
 
-# Перезапускаем SSH
 info "Перезапуск ssh.service..."
 systemctl restart ssh
 ok "SSH-сервис перезапущен"
 
-# Проверяем, что порт начал слушаться
 sleep 2
 if ss -tlnp | grep -q ":$SSH_PORT"; then
     ok "SSH теперь слушает порт $SSH_PORT"
@@ -171,9 +150,9 @@ fi
 success_banner "SSH настроен: порт $SSH_PORT, root только по ключу, сокет отключён"
 
 # =====================================================
-# 4. IP-форвардинг (для VPN)
+# 3. IP-форвардинг (для VPN)
 # =====================================================
-title "4. НАСТРОЙКА IP-ФОРВАРДИНГА"
+title "3. НАСТРОЙКА IP-ФОРВАРДИНГА"
 CURRENT_FORWARD=$(sysctl -n net.ipv4.ip_forward)
 if [ "$CURRENT_FORWARD" -eq 1 ]; then
     ok "IP-форвардинг уже включён"
@@ -189,9 +168,9 @@ else
 fi
 
 # =====================================================
-# 5. Отключение неиспользуемых сервисов
+# 4. Отключение неиспользуемых сервисов
 # =====================================================
-title "5. ОТКЛЮЧЕНИЕ НЕИСПОЛЬЗУЕМЫХ СЕРВИСОВ"
+title "4. ОТКЛЮЧЕНИЕ НЕИСПОЛЬЗУЕМЫХ СЕРВИСОВ"
 SERVICES_TO_DISABLE=(
     cups cups-browsed
     avahi-daemon
@@ -215,9 +194,9 @@ for svc in "${SERVICES_TO_DISABLE[@]}"; do
 done
 
 # =====================================================
-# 6. Установка и настройка fail2ban
+# 5. Установка и настройка fail2ban
 # =====================================================
-title "6. УСТАНОВКА И НАСТРОЙКА FAIL2BAN"
+title "5. УСТАНОВКА И НАСТРОЙКА FAIL2BAN"
 info "Установка fail2ban..."
 apt install -y fail2ban >/dev/null 2>&1
 
@@ -240,22 +219,21 @@ systemctl enable fail2ban --quiet
 ok "fail2ban настроен (блокировка после 3 неудач на 10 минут)"
 
 # =====================================================
-# 7. Настройка файервола nftables
+# 6. Настройка файервола nftables
 # =====================================================
-title "7. НАСТРОЙКА ФАЙЕРВОЛА NFTABLES"
+title "6. НАСТРОЙКА ФАЙЕРВОЛА NFTABLES"
 
-# Показать текущие порты Docker перед запросом
-show_docker_udp_ports
+# Показать текущие порты Docker-контейнеров Amnezia
+show_amnezia_ports
 
 # Запрос портов AmneziaVPN
 echo ""
-read -p "Порты AmneziaVPN (UDP, через запятую, например 443,8443): " AMNEZIA_PORTS_RAW
+read -p "Введите UDP-порты AmneziaVPN (через запятую, например 39127,42448): " AMNEZIA_PORTS_RAW
 IFS=',' read -ra AMNEZIA_PORTS <<< "$AMNEZIA_PORTS_RAW"
 VALID_PORTS=()
 for port in "${AMNEZIA_PORTS[@]}"; do
     port=$(echo "$port" | xargs)
     if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-        # Исключаем дубликаты
         if [[ ! " ${VALID_PORTS[*]} " =~ " ${port} " ]]; then
             VALID_PORTS+=("$port")
         fi
@@ -271,7 +249,7 @@ fi
 
 apt install -y nftables >/dev/null 2>&1
 
-# Резервное копирование текущих правил nftables (не удаляем)
+# Резервное копирование текущих правил nftables
 BACKUP_NFT="/etc/nftables-backup-$(date +%Y%m%d%H%M%S).nft"
 nft list ruleset > "$BACKUP_NFT" 2>/dev/null || true
 ok "Резервная копия nftables: $BACKUP_NFT"
@@ -321,24 +299,19 @@ ok "Файервол nftables применён"
 # Финальная информация
 # =====================================================
 title "ГОТОВО"
-success_banner "Скрипт успешно завершён"
+success_banner "Скрипт безопасной настройки успешно завершён"
 echo ""
 info "Доступ к серверу: только по SSH-ключу для root"
 info "Порт SSH: $SSH_PORT"
 info "Порты AmneziaVPN (UDP): ${VALID_PORTS[*]}"
 echo ""
 
-# Определяем внешний IP (если curl есть)
-if command -v curl &>/dev/null; then
-    EXTERNAL_IP=$(curl -s ifconfig.me 2>/dev/null || echo "<IP_сервера>")
-else
-    EXTERNAL_IP="<IP_сервера>"
-fi
-
-echo -e "${YELLOW}${BOLD}⚠️  ВАЖНО:${NC} Прежде чем закрыть текущую сессию, проверьте новое подключение:"
-echo -e "  ${CYAN}ssh -p $SSH_PORT -i /путь/до/ключа root@$EXTERNAL_IP${NC}"
+# Важное предупреждение выводим сразу (без curl для скорости)
+echo -e "${YELLOW}${BOLD}⚠️  ВАЖНО:${NC} Прежде чем закрыть текущую сессию, откройте НОВОЕ окно терминала и проверьте подключение:"
+echo -e "  ${CYAN}ssh -p $SSH_PORT -i /путь/до/ключа root@$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)${NC}"
 echo ""
 echo -e "Если подключение не удаётся, откатите конфиг SSH:"
 echo -e "  ${YELLOW}cp $SSH_BACKUP /etc/ssh/sshd_config && systemctl restart ssh${NC}"
 echo -e "  ${YELLOW}systemctl enable --now ssh.socket   # если нужен сокет обратно${NC}"
 echo ""
+info "Рекомендуется перезагрузить сервер после завершения настройки: reboot"
