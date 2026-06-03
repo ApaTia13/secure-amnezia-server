@@ -154,14 +154,19 @@ systemctl restart fail2ban
 echo "fail2ban настроен для защиты SSH на порту $SSH_PORT."
 
 echo "=== 7. Настройка файервола nftables ==="
-read -p "Порт AmneziaVPN (UDP), который уже используется: " AMNEZIA_PORT
-if ! [[ "$AMNEZIA_PORT" =~ ^[0-9]+$ ]] || [ "$AMNEZIA_PORT" -lt 1 ] || [ "$AMNEZIA_PORT" -gt 65535 ]; then
-    echo "Некорректный порт. Выход."
-    exit 1
-fi
+# AmneziaVPN может слушать на нескольких UDP-портах одновременно (например, 443 и 8443)
+read -p "Порты AmneziaVPN (UDP, через запятую, напр. 443,8443): " AMNEZIA_PORTS_RAW
+IFS=',' read -ra AMNEZIA_PORTS <<< "$AMNEZIA_PORTS_RAW"
+for port in "${AMNEZIA_PORTS[@]}"; do
+    port=$(echo "$port" | xargs)
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo "Некорректный порт '$port'. Выход."
+        exit 1
+    fi
+done
 
 apt install -y nftables
-# Сохраняем старые правила на случай, если новые сломают доступ
+# Сохраняем старые правила на случай, если новые заблокируют доступ
 nft list ruleset > /etc/nftables-backup-$(date +%Y%m%d%H%M%S).nft 2>/dev/null || true
 
 NFT_FILE="/etc/nftables.conf"
@@ -172,31 +177,38 @@ flush ruleset
 
 table inet filter {
     chain input {
-        type filter hook input priority 0; policy drop;   # Всё, что не разрешено явно, запрещено
+        type filter hook input priority 0; policy drop;   # Всё, что не разрешено, запрещено
 
-        iif lo accept                     # localhost всегда доверенный
-        ct state established,related accept   # Разрешаем ответы на наши запросы
+        iif lo accept                     # loopback всегда доверяем
+        ct state established,related accept   # Пускаем ответы на исходящие запросы
 
-        tcp dport $SSH_PORT accept        # SSH с нестандартного порта
-        udp dport $AMNEZIA_PORT accept    # Порт для AmneziaVPN
+        tcp dport $SSH_PORT accept        # Нестандартный порт SSH (меньше сканеров)
+EOF
+
+# Добавляем все указанные UDP-порты для AmneziaVPN
+for port in "${AMNEZIA_PORTS[@]}"; do
+    echo "        udp dport $port accept" >> "$NFT_FILE"
+done
+
+cat >> "$NFT_FILE" <<EOF
 
         ip protocol icmp accept
-        ip6 nexthdr icmpv6 accept         # ping полезен для диагностики, но не опасен
+        ip6 nexthdr icmpv6 accept         # ping полезен для диагностики
     }
 
     chain forward {
-        type filter hook forward priority 0; policy drop;   # По умолчанию маршрутизация запрещена
+        type filter hook forward priority 0; policy drop;   # Маршрутизация запрещена по умолчанию
     }
 
     chain output {
-        type filter hook output priority 0; policy accept;  # Исходящее разрешено всё (но можно усилить)
+        type filter hook output priority 0; policy accept;  # Исходящее разрешено
     }
 }
 EOF
 
 nft -f "$NFT_FILE"
 systemctl enable nftables
-echo "Файервол применён. Открыты: порт SSH $SSH_PORT/TCP, Amnezia $AMNEZIA_PORT/UDP, ICMP."
+echo "Файервол применён. Открыты: порт SSH $SSH_PORT/TCP, Amnezia порты ${AMNEZIA_PORTS[*]}/UDP, ICMP."
 
 echo "=== Готово ==="
 echo "Пользователь $NEW_USER создан. Для SSH обязателен ключ + пароль."
