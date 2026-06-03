@@ -254,7 +254,16 @@ BACKUP_NFT="/etc/nftables-backup-$(date +%Y%m%d%H%M%S).nft"
 nft list ruleset > "$BACKUP_NFT" 2>/dev/null || true
 ok "Резервная копия nftables: $BACKUP_NFT"
 
-# Генерация нового конфига
+# Определяем внешний сетевой интерфейс
+EXT_IF=$(ip route | grep default | awk '{print $5}')
+if [[ -z "$EXT_IF" ]]; then
+    warn "Не удалось определить внешний интерфейс, masquerade может не работать"
+    EXT_IF="eth0"  # fallback
+else
+    ok "Внешний интерфейс: $EXT_IF"
+fi
+
+# Генерация конфига nftables с NAT
 NFT_FILE="/etc/nftables.conf"
 cat > "$NFT_FILE" <<EOF
 #!/usr/sbin/nft -f
@@ -283,17 +292,28 @@ cat >> "$NFT_FILE" <<EOF
 
     chain forward {
         type filter hook forward priority 0; policy drop;
+
+        # Разрешаем форвардинг для VPN-трафика (интерфейсы типа wg+)
+        iifname "wg+" oifname "$EXT_IF" accept
+        iifname "$EXT_IF" oifname "wg+" ct state related,established accept
     }
 
     chain output {
         type filter hook output priority 0; policy accept;
     }
 }
+
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname "$EXT_IF" masquerade
+    }
+}
 EOF
 
 nft -f "$NFT_FILE"
 systemctl enable nftables --quiet
-ok "Файервол nftables применён"
+ok "Файервол nftables с NAT применён"
 
 # =====================================================
 # Финальная информация
@@ -307,8 +327,9 @@ info "Порты AmneziaVPN (UDP): ${VALID_PORTS[*]}"
 echo ""
 
 # Важное предупреждение выводим сразу (без curl для скорости)
+EXTERNAL_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
 echo -e "${YELLOW}${BOLD}⚠️  ВАЖНО:${NC} Прежде чем закрыть текущую сессию, откройте НОВОЕ окно терминала и проверьте подключение:"
-echo -e "  ${CYAN}ssh -p $SSH_PORT -i /путь/до/ключа root@$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)${NC}"
+echo -e "  ${CYAN}ssh -p $SSH_PORT -i /путь/до/ключа root@$EXTERNAL_IP${NC}"
 echo ""
 echo -e "Если подключение не удаётся, откатите конфиг SSH:"
 echo -e "  ${YELLOW}cp $SSH_BACKUP /etc/ssh/sshd_config && systemctl restart ssh${NC}"
