@@ -264,6 +264,7 @@ else
 fi
 
 # Генерация конфига nftables с NAT
+# Генерация конфига nftables с NAT
 NFT_FILE="/etc/nftables.conf"
 cat > "$NFT_FILE" <<EOF
 #!/usr/sbin/nft -f
@@ -292,10 +293,20 @@ cat >> "$NFT_FILE" <<EOF
 
     chain forward {
         type filter hook forward priority 0; policy drop;
+EOF
 
-        # Разрешаем форвардинг для VPN-трафика (интерфейсы типа wg+)
-        iifname "wg+" oifname "$EXT_IF" accept
-        iifname "$EXT_IF" oifname "wg+" ct state related,established accept
+# Динамически добавляем правила для всех VPN-интерфейсов (wg*, amn*)
+VPN_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^(wg|amn)' || true)
+if [[ -n "$VPN_IFACES" ]]; then
+    for iface in $VPN_IFACES; do
+        echo "        iifname \"$iface\" oifname \"$EXT_IF\" accept" >> "$NFT_FILE"
+        echo "        iifname \"$EXT_IF\" oifname \"$iface\" ct state related,established accept" >> "$NFT_FILE"
+    done
+else
+    echo "        # Нет VPN-интерфейсов (wg* или amn*)" >> "$NFT_FILE"
+fi
+
+cat >> "$NFT_FILE" <<EOF
     }
 
     chain output {
