@@ -39,7 +39,7 @@ save_config() {
     cat > "$CONFIG_MARKER" <<EOF
 # Сконфигурировано: $(date)
 SSH_PORT=${SSH_PORT:-22}
-VPN_PORTS=${VALID_PORTS[*]:-}
+VALID_PORTS=${VALID_PORTS[*]:-}
 EXTRA_PORTS=${EXTRA_PORTS[*]:-}
 LAST_RUN=$(date +%s)
 EOF
@@ -94,7 +94,17 @@ fi
 ok "Найдены контейнеры AmneziaVPN: $(echo "$AMNEZIA_CONTAINERS" | tr '\n' ' ')"
 
 # =====================================================
-# Обновление системы и установка зависимостей
+# ПРОВЕРКА: скрипт уже запускался? (ТЕПЕРЬ ЗДЕСЬ, ДО ДОЛГИХ ОПЕРАЦИЙ)
+# =====================================================
+if load_config; then
+    info "Обнаружена предыдущая конфигурация. Открываю меню управления..."
+    # Вызываем функцию main_menu (она определена ниже, bash позволяет это)
+    main_menu
+    exit 0
+fi
+
+# =====================================================
+# ОБНОВЛЕНИЕ СИСТЕМЫ И УСТАНОВКА ЗАВИСИМОСТЕЙ (только при первом запуске)
 # =====================================================
 title "ОБНОВЛЕНИЕ СИСТЕМЫ И УСТАНОВКА ЗАВИСИМОСТЕЙ"
 
@@ -155,16 +165,16 @@ generate_nftables_config() {
 
 table inet filter {
     chain input {
-        type filter hook input priority 0; policy drop;
-        iif lo accept
+        type filter hook input priority filter; policy drop;
+        iif "lo" accept
         ct state established,related accept
         ct state invalid drop
         tcp dport ${SSH_PORT:-22} accept
 EOF
 
-    # Добавляем VPN порты (UDP)
-    if [[ -n "${VPN_PORTS:-}" ]]; then
-        for port in ${VPN_PORTS}; do
+    # Добавляем VPN порты (UDP) - ИСПРАВЛЕНО: теперь читаем VALID_PORTS
+    if [[ -n "${VALID_PORTS:-}" ]]; then
+        for port in ${VALID_PORTS}; do
             echo "        udp dport $port accept" >> "$tmp_nft"
         done
     fi
@@ -180,11 +190,11 @@ EOF
     
     cat >> "$tmp_nft" <<EOF
         ip protocol icmp accept
-        limit rate 5/minute log prefix "nft-input-drop: "
+        limit rate 5/minute burst 5 packets log prefix "nft-input-drop: "
     }
 
     chain forward {
-        type filter hook forward priority 0; policy drop;
+        type filter hook forward priority filter; policy drop;
         ct state established,related accept
         ct state invalid drop
         iifname "wg*" accept
@@ -195,17 +205,17 @@ EOF
         oifname "docker0" accept
         iifname "br-*" accept
         oifname "br-*" accept
-        limit rate 5/minute log prefix "nft-forward-drop: "
+        limit rate 5/minute burst 5 packets log prefix "nft-forward-drop: "
     }
 
     chain output {
-        type filter hook output priority 0; policy accept;
+        type filter hook output priority filter; policy accept;
     }
 }
 
 table inet nat {
     chain postrouting {
-        type nat hook postrouting priority 100; policy accept;
+        type nat hook postrouting priority srcnat; policy accept;
         oifname "$ext_if" masquerade
     }
 }
@@ -234,7 +244,7 @@ main_menu() {
     title "УПРАВЛЕНИЕ ЗАЩИТОЙ СЕРВЕРА"
     echo -e "${CYAN}Текущая конфигурация:${NC}"
     echo "  SSH порт: ${SSH_PORT:-22}"
-    [[ -n "${VPN_PORTS:-}" ]] && echo "  VPN порты (UDP): ${VPN_PORTS}"
+    [[ -n "${VALID_PORTS:-}" ]] && echo "  VPN порты (UDP): ${VALID_PORTS}"
     [[ -n "${EXTRA_PORTS:-}" ]] && echo "  Доп. порты: ${EXTRA_PORTS}"
     echo ""
     echo "1) Изменить SSH-ключ"
@@ -328,15 +338,6 @@ main_menu() {
         *) err "Неверный выбор" ;;
     esac
 }
-
-# =====================================================
-# ПРОВЕРКА: скрипт уже запускался?
-# =====================================================
-if load_config; then
-    info "Обнаружена предыдущая конфигурация."
-    main_menu
-    exit 0
-fi
 
 # =====================================================
 # ПЕРВЫЙ ЗАПУСК: полная настройка
@@ -455,7 +456,6 @@ while true; do
     for port in "${AMNEZIA_PORTS[@]}"; do
         port=$(echo "$port" | xargs) # убираем пробелы
         if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-            # Проверка на дубликаты
             if [[ ! " ${VALID_PORTS[*]} " =~ " ${port} " ]]; then
                 VALID_PORTS+=("$port")
             fi
@@ -471,16 +471,12 @@ while true; do
     fi
 done
 
-# Инициализируем пустой массив доп. портов
 EXTRA_PORTS=()
-
-# Бэкап текущего ruleset
 nft list ruleset > "/etc/nftables-backup-$(date +%Y%m%d%H%M%S).nft" 2>/dev/null || true
 
 generate_nftables_config
 systemctl enable --quiet nftables
 
-# Зависимость Docker от nftables
 if systemctl list-unit-files | grep -q "^docker.service"; then
     mkdir -p /etc/systemd/system/docker.service.d
     cat > /etc/systemd/system/docker.service.d/10-after-nftables.conf <<'EOF'
