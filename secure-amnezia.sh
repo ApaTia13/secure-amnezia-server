@@ -1,9 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# =====================================================
-# Делаем все apt-операции неинтерактивными
-# =====================================================
 export DEBIAN_FRONTEND=noninteractive
 export TERM=xterm
 
@@ -12,16 +9,7 @@ if command -v debconf-set-selections &>/dev/null; then
     echo "keyboard-configuration keyboard-configuration/layout select USA" | debconf-set-selections 2>/dev/null || true
 fi
 
-# =====================================================
-# Цветное оформление
-# =====================================================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 ok()    { echo -e "${GREEN}✓${NC} $1"; }
 warn()  { echo -e "${YELLOW}⚠${NC} $1"; }
@@ -30,9 +18,6 @@ info()  { echo -e "${CYAN}➜${NC} $1"; }
 title() { echo -e "\n${BOLD}${BLUE}=== $1 ===${NC}\n"; }
 success_banner() { echo -e "${GREEN}${BOLD}✅ $1${NC}"; }
 
-# =====================================================
-# Маркер конфигурации (для меню при повторном запуске)
-# =====================================================
 CONFIG_MARKER="/root/.server-hardening.conf"
 
 save_config() {
@@ -48,14 +33,12 @@ EOF
 
 load_config() {
     if [[ -f "$CONFIG_MARKER" ]]; then
-        # shellcheck disable=SC1090
         source "$CONFIG_MARKER"
         return 0
     fi
     return 1
 }
 
-# ФУНКЦИЯ: Показать порты Amnezia
 show_amnezia_ports() {
     local containers
     containers=$(docker ps --filter "name=amnezia" --format "{{.Names}}\t{{.Ports}}" 2>/dev/null || true)
@@ -71,13 +54,25 @@ show_amnezia_ports() {
     fi
 }
 
-# ФУНКЦИЯ: Генерация и применение конфига nftables
+# Функция для получения VPN подсети (для фильтрации по Source IP)
+get_vpn_subnets() {
+    # Ищем подсети на интерфейсах amn* и wg*
+    ip -4 -o addr show | grep -E 'amn|wg' | awk '{print $4}' | tr '\n' ', ' | sed 's/,$//'
+}
+
 generate_nftables_config() {
     info "Генерация конфига nftables..."
     
     local ext_if
     ext_if=$(ip -4 route show default | awk '{print $5; exit}')
     ext_if=${ext_if:-eth0}
+    
+    local vpn_subnets
+    vpn_subnets=$(get_vpn_subnets)
+    # Если не нашли специфичных, добавляем стандартные VPN-диапазоны как fallback
+    if [[ -z "$vpn_subnets" ]]; then
+        vpn_subnets="10.8.0.0/8, 10.9.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
+    fi
     
     local tmp_nft
     tmp_nft=$(mktemp)
@@ -104,7 +99,6 @@ EOF
             local scope="${port_entry%%:*}"
             local rule_data="${port_entry#*:}"
             
-            # Обратная совместимость: если префикса нет, считаем что это pub
             if [[ "$scope" != "pub" && "$scope" != "vpn" ]]; then
                 scope="pub"
                 rule_data="$port_entry"
@@ -114,9 +108,8 @@ EOF
             local p_proto="${rule_data#*/}"
             
             if [[ "$scope" == "vpn" ]]; then
-                # Разрешаем только с VPN интерфейсов
-                echo "        iifname \"amn*\" $p_proto dport $p_num accept" >> "$tmp_nft"
-                echo "        iifname \"wg*\" $p_proto dport $p_num accept" >> "$tmp_nft"
+                # Разрешаем ТОЛЬКО если Source IP принадлежит VPN-подсети
+                echo "        ip saddr { $vpn_subnets } $p_proto dport $p_num accept" >> "$tmp_nft"
             else
                 # Публичный доступ
                 echo "        $p_proto dport $p_num accept" >> "$tmp_nft"
@@ -169,7 +162,6 @@ EOF
     ok "Правила nftables успешно применены"
 }
 
-# ФУНКЦИЯ: Главное меню
 main_menu() {
     title "УПРАВЛЕНИЕ ЗАЩИТОЙ СЕРВЕРА"
     echo -e "${CYAN}Текущая конфигурация:${NC}"
@@ -224,7 +216,7 @@ main_menu() {
                 else
                     echo "Где должен быть доступен этот порт?"
                     echo "  1) В интернете (публичный доступ, как SSH)"
-                    echo "  2) Только внутри VPN сети (через Amnezia/WireGuard)"
+                    echo "  2) Только для клиентов VPN (фильтрация по Source IP)"
                     read -rp "Ваш выбор (1-2, по умолчанию 1): " scope_choice
                     
                     local scope="pub"
@@ -235,7 +227,7 @@ main_menu() {
                     save_config
                     
                     if [[ "$scope" == "vpn" ]]; then
-                        ok "Порт $new_p добавлен (доступен ТОЛЬКО через VPN)"
+                        ok "Порт $new_p добавлен (доступен ТОЛЬКО с VPN-IP)"
                     else
                         ok "Порт $new_p добавлен (публичный доступ)"
                     fi
@@ -301,9 +293,8 @@ main_menu() {
 }
 
 # =====================================================
-# НАЧАЛО ВЫПОЛНЕНИЯ СКРИПТА
+# НАЧАЛО ВЫПОЛНЕНИЯ
 # =====================================================
-
 if [[ $EUID -ne 0 ]]; then
     err "Скрипт должен выполняться от root (sudo)."
     exit 1
@@ -314,21 +305,12 @@ exec > >(tee -a "$LOGFILE") 2>&1
 info "Лог этого запуска сохраняется в: $LOGFILE"
 
 title "ПРОВЕРКА НАЛИЧИЯ DOCKER И AMNEZIAVPN"
-if ! command -v docker &>/dev/null; then
-    err "Docker не установлен."
-    exit 1
-fi
-if ! systemctl is-active --quiet docker; then
-    err "Docker установлен, но не запущен."
-    exit 1
-fi
+if ! command -v docker &>/dev/null; then err "Docker не установлен."; exit 1; fi
+if ! systemctl is-active --quiet docker; then err "Docker не запущен."; exit 1; fi
 ok "Docker установлен и запущен"
 
 AMNEZIA_CONTAINERS=$(docker ps -a --filter "name=amnezia" --format "{{.Names}}" 2>/dev/null || true)
-if [[ -z "$AMNEZIA_CONTAINERS" ]]; then
-    err "Контейнеры AmneziaVPN не обнаружены."
-    exit 1
-fi
+if [[ -z "$AMNEZIA_CONTAINERS" ]]; then err "Контейнеры AmneziaVPN не обнаружены."; exit 1; fi
 ok "Найдены контейнеры AmneziaVPN: $(echo "$AMNEZIA_CONTAINERS" | tr '\n' ' ')"
 
 if load_config; then
@@ -337,41 +319,33 @@ if load_config; then
     exit 0
 fi
 
-title "ОБНОВЛЕНИЕ СИСТЕМЫ И УСТАНОВКА ЗАВИСИМОСТЕЙ"
+title "ОБНОВЛЕНИЕ СИСТЕМЫ"
 apt-get update -qq || warn "apt update завершился с предупреждением"
 apt-get upgrade -y -qq || warn "apt upgrade завершился с предупреждением"
 apt-get install -y -qq openssh-server openssh-client nftables fail2ban iproute2 procps >/dev/null 2>&1 || warn "Некоторые пакеты не удалось установить"
-ok "Система обновлена, зависимости установлены"
+ok "Система обновлена"
 
 if command -v iptables &>/dev/null && iptables --version 2>/dev/null | grep -qi legacy; then
     warn "Docker использует iptables-legacy."
 else
-    ok "Docker использует nftables-бэкенд (iptables-nft)"
+    ok "Docker использует nftables-бэкенд"
 fi
 
-title "1. НАСТРОЙКА SSH-КЛЮЧА ДЛЯ ROOT"
-mkdir -p /root/.ssh
-chmod 700 /root/.ssh
+title "1. НАСТРОЙКА SSH-КЛЮЧА"
+mkdir -p /root/.ssh; chmod 700 /root/.ssh
 echo -e "${YELLOW}ВАЖНО: Убедитесь, что вставляете правильный публичный ключ.${NC}\n"
-
 while true; do
     read -rp "Вставьте публичный SSH-ключ: " ROOT_SSH_KEY
-    if [[ -z "$ROOT_SSH_KEY" ]]; then
-        err "Ключ не может быть пустым"
-        continue
-    fi
+    [[ -z "$ROOT_SSH_KEY" ]] && { err "Ключ не может быть пустым"; continue; }
     tmp_key=$(mktemp)
     echo "$ROOT_SSH_KEY" > "$tmp_key"
     if ssh-keygen -lf "$tmp_key" >/dev/null 2>&1; then
-        rm -f "$tmp_key"
-        break
+        rm -f "$tmp_key"; break
     else
-        err "Невалидный ключ."
-        rm -f "$tmp_key"
+        err "Невалидный ключ."; rm -f "$tmp_key"
     fi
 done
-echo "$ROOT_SSH_KEY" > /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys
+echo "$ROOT_SSH_KEY" > /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
 ok "SSH-ключ сохранён"
 
 title "2. НАСТРОЙКА SSH-СЕРВЕРА"
@@ -382,11 +356,7 @@ info "Текущий порт SSH: ${current_ssh_port:-22}"
 while true; do
     read -rp "Новый порт SSH (по умолчанию 22): " SSH_PORT
     SSH_PORT=${SSH_PORT:-22}
-    if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then
-        break
-    else
-        err "Введите число от 1 до 65535"
-    fi
+    if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then break; else err "Введите число от 1 до 65535"; fi
 done
 
 sed -i "s/^#*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
@@ -400,36 +370,25 @@ grep -q "^PubkeyAuthentication " /etc/ssh/sshd_config || echo "PubkeyAuthenticat
 sed -i '/^AllowUsers /d' /etc/ssh/sshd_config
 echo "AllowUsers root" >> /etc/ssh/sshd_config
 
-if ! sshd -t; then
-    err "Ошибка в конфигурации SSH!"
-    exit 1
-fi
-systemctl stop ssh.socket 2>/dev/null || true
-systemctl disable ssh.socket 2>/dev/null || true
-systemctl restart ssh
-sleep 2
-if ss -tlnH "sport = :$SSH_PORT" 2>/dev/null | grep -q LISTEN; then
-    ok "SSH слушает порт $SSH_PORT"
-else
-    warn "Порт $SSH_PORT не обнаружен."
-fi
+if ! sshd -t; then err "Ошибка в конфигурации SSH!"; exit 1; fi
+systemctl stop ssh.socket 2>/dev/null || true; systemctl disable ssh.socket 2>/dev/null || true
+systemctl restart ssh; sleep 2
+if ss -tlnH "sport = :$SSH_PORT" 2>/dev/null | grep -q LISTEN; then ok "SSH слушает порт $SSH_PORT"; else warn "Порт $SSH_PORT не обнаружен."; fi
 
-title "3. НАСТРОЙКА IP-ФОРВАРДИНГА И ОТКЛЮЧЕНИЕ IPv6"
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
-echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/99-amnezia.conf 2>/dev/null || true
-sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
-sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
+title "3. IP-ФОРВАРДИНГ И IPv6"
+sysctl -w net.ipv4.ip_forward=1 >/dev/null; echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/99-amnezia.conf 2>/dev/null || true
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null; sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
 echo "net.ipv6.conf.all.disable_ipv6=1" >> /etc/sysctl.d/99-amnezia.conf 2>/dev/null || true
 echo "net.ipv6.conf.default.disable_ipv6=1" >> /etc/sysctl.d/99-amnezia.conf 2>/dev/null || true
 ok "IP-форвардинг включён, IPv6 отключён"
 
-title "4. ОТКЛЮЧЕНИЕ НЕИСПОЛЬЗУЕМЫХ СЕРВИСОВ"
+title "4. ОТКЛЮЧЕНИЕ СЕРВИСОВ"
 for svc in cups avahi-daemon ModemManager whoopsie kerneloops bluetooth multipathd; do
     systemctl disable --now "$svc" 2>/dev/null || true
 done
 ok "Лишние сервисы отключены"
 
-title "5. НАСТРОЙКА FAIL2BAN"
+title "5. FAIL2BAN"
 cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 banaction = nftables-allports
@@ -440,13 +399,11 @@ maxretry = 3
 enabled = true
 port = $SSH_PORT
 EOF
-systemctl restart fail2ban
-systemctl enable --quiet fail2ban
+systemctl restart fail2ban; systemctl enable --quiet fail2ban
 ok "fail2ban настроен"
 
-title "6. НАСТРОЙКА ФАЙЕРВОЛА NFTABLES"
-show_amnezia_ports
-echo ""
+title "6. ФАЙЕРВОЛ NFTABLES"
+show_amnezia_ports; echo ""
 
 while true; do
     read -rp "Введите UDP-порты AmneziaVPN через запятую: " AMNEZIA_PORTS_RAW
@@ -455,18 +412,12 @@ while true; do
     for port in "${AMNEZIA_PORTS[@]}"; do
         port=$(echo "$port" | xargs)
         if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-            if [[ ! " ${VALID_PORTS[*]} " =~ " ${port} " ]]; then
-                VALID_PORTS+=("$port")
-            fi
+            if [[ ! " ${VALID_PORTS[*]} " =~ " ${port} " ]]; then VALID_PORTS+=("$port"); fi
         else
             warn "Порт '$port' пропущен (некорректный)"
         fi
     done
-    if [ ${#VALID_PORTS[@]} -eq 0 ]; then
-        err "Не указано ни одного корректного порта. Попробуйте снова."
-    else
-        break
-    fi
+    if [ ${#VALID_PORTS[@]} -eq 0 ]; then err "Не указано ни одного корректного порта. Попробуйте снова."; else break; fi
 done
 
 EXTRA_PORTS=()
@@ -482,17 +433,11 @@ if systemctl list-unit-files | grep -q "^docker.service"; then
 After=nftables.service
 Wants=nftables.service
 EOF
-    systemctl daemon-reload
-    ok "Docker настроен на запуск после nftables"
+    systemctl daemon-reload; ok "Docker настроен на запуск после nftables"
 fi
-
 systemctl restart fail2ban 2>/dev/null || true
 
-# =====================================================
-# ФИНАЛ
-# =====================================================
 save_config
-
 title "ГОТОВО"
 success_banner "Скрипт безопасной настройки успешно завершён"
 info "Порт SSH: $SSH_PORT"
