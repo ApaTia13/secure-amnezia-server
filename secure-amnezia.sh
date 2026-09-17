@@ -26,7 +26,6 @@ save_config() {
 SSH_PORT="${SSH_PORT:-22}"
 VALID_PORTS="${VALID_PORTS[*]:-}"
 EXTRA_PORTS="${EXTRA_PORTS[*]:-}"
-VPN_SUBNET="${VPN_SUBNET:-}"
 LAST_RUN="$(date +%s)"
 EOF
     chmod 600 "$CONFIG_MARKER"
@@ -55,34 +54,12 @@ show_amnezia_ports() {
     fi
 }
 
-get_vpn_subnet() {
-    local vpn_ip
-    vpn_ip=$(ip -4 -o addr show | grep -E 'amn|wg' | awk '{print $4}' | head -1)
-    
-    if [[ -n "$vpn_ip" ]]; then
-        local ip_part="${vpn_ip%/*}"
-        local mask_part="${vpn_ip#*/}"
-        
-        if [[ "$mask_part" == "24" ]]; then
-            echo "${ip_part%.*}.0/24"
-        elif [[ "$mask_part" == "16" ]]; then
-            echo "${ip_part%.*.*}.0.0/16"
-        else
-            echo "$vpn_ip"
-        fi
-    else
-        echo "10.8.0.0/24"
-    fi
-}
-
 generate_nftables_config() {
     info "Генерация конфига nftables..."
     
     local ext_if
     ext_if=$(ip -4 route show default | awk '{print $5; exit}')
     ext_if=${ext_if:-eth0}
-    
-    local vpn_subnet="${VPN_SUBNET:-$(get_vpn_subnet)}"
     
     local tmp_nft
     tmp_nft=$(mktemp)
@@ -109,6 +86,7 @@ EOF
             local scope="${port_entry%%:*}"
             local rule_data="${port_entry#*:}"
             
+            # Обратная совместимость: если нет префикса, считаем pub
             if [[ "$scope" != "pub" && "$scope" != "vpn" ]]; then
                 scope="pub"
                 rule_data="$port_entry"
@@ -118,7 +96,8 @@ EOF
             local p_proto="${rule_data#*/}"
             
             if [[ "$scope" == "vpn" ]]; then
-                echo "        iifname { \"amn*\", \"wg*\" } ip saddr $vpn_subnet $p_proto dport $p_num accept" >> "$tmp_nft"
+                # Только через VPN-интерфейс
+                echo "        iifname { \"amn*\", \"wg*\" } $p_proto dport $p_num accept" >> "$tmp_nft"
             else
                 echo "        $p_proto dport $p_num accept" >> "$tmp_nft"
             fi
@@ -176,7 +155,6 @@ main_menu() {
     echo "  SSH порт: ${SSH_PORT:-22}"
     [[ -n "${VALID_PORTS:-}" ]] && echo "  VPN порты (UDP): ${VALID_PORTS}"
     [[ -n "${EXTRA_PORTS:-}" ]] && echo "  Доп. порты: ${EXTRA_PORTS}"
-    [[ -n "${VPN_SUBNET:-}" ]] && echo "  VPN подсеть: ${VPN_SUBNET}"
     echo ""
     echo "1) Изменить SSH-ключ"
     echo "2) Изменить порт SSH"
@@ -225,23 +203,18 @@ main_menu() {
                 else
                     echo "Где должен быть доступен этот порт?"
                     echo "  1) В интернете (публичный доступ, как SSH)"
-                    echo "  2) ТОЛЬКО через VPN-туннель (фильтр по интерфейсу + IP подсети)"
+                    echo "  2) ТОЛЬКО через VPN-туннель (безопасный доступ)"
                     read -rp "Ваш выбор (1-2, по умолчанию 1): " scope_choice
                     
                     local scope="pub"
                     [[ "$scope_choice" == "2" ]] && scope="vpn"
-                    
-                    if [[ "$scope" == "vpn" && -z "${VPN_SUBNET:-}" ]]; then
-                        VPN_SUBNET=$(get_vpn_subnet)
-                        info "Определена VPN подсеть: $VPN_SUBNET"
-                    fi
                     
                     EXTRA_PORTS="${EXTRA_PORTS:-} ${scope}:${new_p}"
                     generate_nftables_config
                     save_config
                     
                     if [[ "$scope" == "vpn" ]]; then
-                        ok "Порт $new_p добавлен (доступен ТОЛЬКО через VPN с IP из $VPN_SUBNET)"
+                        ok "Порт $new_p добавлен (доступен ТОЛЬКО через VPN)"
                     else
                         ok "Порт $new_p добавлен (публичный доступ)"
                     fi
@@ -393,9 +366,6 @@ echo "net.ipv6.conf.all.disable_ipv6=1" >> /etc/sysctl.d/99-amnezia.conf 2>/dev/
 echo "net.ipv6.conf.default.disable_ipv6=1" >> /etc/sysctl.d/99-amnezia.conf 2>/dev/null || true
 ok "IP-форвардинг включён, IPv6 отключён"
 
-VPN_SUBNET=$(get_vpn_subnet)
-info "Определена VPN подсеть: $VPN_SUBNET"
-
 title "4. ОТКЛЮЧЕНИЕ СЕРВИСОВ"
 for svc in cups avahi-daemon ModemManager whoopsie kerneloops bluetooth multipathd; do
     systemctl disable --now "$svc" 2>/dev/null || true
@@ -456,7 +426,6 @@ title "ГОТОВО"
 success_banner "Скрипт безопасной настройки успешно завершён"
 info "Порт SSH: $SSH_PORT"
 info "Порты AmneziaVPN (UDP): ${VALID_PORTS[*]}"
-info "VPN подсеть: $VPN_SUBNET"
 
 external_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
 echo -e "\n${YELLOW}⚠️ ВАЖНО: Не закрывайте текущую сессию!${NC}"
