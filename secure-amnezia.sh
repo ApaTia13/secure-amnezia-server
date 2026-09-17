@@ -14,7 +14,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CY
 ok()    { echo -e "${GREEN}✓${NC} $1"; }
 warn()  { echo -e "${YELLOW}⚠${NC} $1"; }
 err()   { echo -e "${RED}✗${NC} $1"; }
-info()  { echo -e "${CYAN}${NC} $1"; }
+info()  { echo -e "${CYAN}➜${NC} $1"; }
 title() { echo -e "\n${BOLD}${BLUE}=== $1 ===${NC}\n"; }
 success_banner() { echo -e "${GREEN}${BOLD}✅ $1${NC}"; }
 
@@ -55,34 +55,22 @@ show_amnezia_ports() {
     fi
 }
 
-# Функция для получения VPN подсети
 get_vpn_subnet() {
-    # Ищем IP-адрес на интерфейсах amn* или wg* и определяем подсеть
     local vpn_ip
     vpn_ip=$(ip -4 -o addr show | grep -E 'amn|wg' | awk '{print $4}' | head -1)
     
     if [[ -n "$vpn_ip" ]]; then
-        # Преобразуем IP/маска в подсеть (например, 10.8.0.1/24 -> 10.8.0.0/24)
         local ip_part="${vpn_ip%/*}"
         local mask_part="${vpn_ip#*/}"
         
-        if [[ "$mask_part" =~ ^[0-9]+$ ]]; then
-            # CIDR маска
-            local mask=$(( 0xFFFFFFFF << (32 - mask_part) & 0xFFFFFFFF ))
-            local ip_int=$(( (10#${ip_part//./ })))
-            # Упрощенно: берем первые 3 октета для /24
-            if [[ "$mask_part" -eq 24 ]]; then
-                echo "${ip_part%.*}.0/24"
-            elif [[ "$mask_part" -eq 16 ]]; then
-                echo "${ip_part%.*.*}.0.0/16"
-            else
-                echo "$vpn_ip"
-            fi
+        if [[ "$mask_part" == "24" ]]; then
+            echo "${ip_part%.*}.0/24"
+        elif [[ "$mask_part" == "16" ]]; then
+            echo "${ip_part%.*.*}.0.0/16"
         else
             echo "$vpn_ip"
         fi
     else
-        # Fallback: стандартные VPN-подсети
         echo "10.8.0.0/24"
     fi
 }
@@ -94,7 +82,6 @@ generate_nftables_config() {
     ext_if=$(ip -4 route show default | awk '{print $5; exit}')
     ext_if=${ext_if:-eth0}
     
-    # Получаем VPN подсеть
     local vpn_subnet="${VPN_SUBNET:-$(get_vpn_subnet)}"
     
     local tmp_nft
@@ -122,7 +109,6 @@ EOF
             local scope="${port_entry%%:*}"
             local rule_data="${port_entry#*:}"
             
-            # Обратная совместимость
             if [[ "$scope" != "pub" && "$scope" != "vpn" ]]; then
                 scope="pub"
                 rule_data="$port_entry"
@@ -132,10 +118,8 @@ EOF
             local p_proto="${rule_data#*/}"
             
             if [[ "$scope" == "vpn" ]]; then
-                # ДВОЙНАЯ ЗАЩИТА: интерфейс VPN + IP из VPN-подсети
                 echo "        iifname { \"amn*\", \"wg*\" } ip saddr $vpn_subnet $p_proto dport $p_num accept" >> "$tmp_nft"
             else
-                # Публичный доступ
                 echo "        $p_proto dport $p_num accept" >> "$tmp_nft"
             fi
         done
@@ -247,7 +231,6 @@ main_menu() {
                     local scope="pub"
                     [[ "$scope_choice" == "2" ]] && scope="vpn"
                     
-                    # Если VPN подсеть не задана, определяем её
                     if [[ "$scope" == "vpn" && -z "${VPN_SUBNET:-}" ]]; then
                         VPN_SUBNET=$(get_vpn_subnet)
                         info "Определена VPN подсеть: $VPN_SUBNET"
@@ -323,9 +306,6 @@ main_menu() {
     esac
 }
 
-# =====================================================
-# НАЧАЛО ВЫПОЛНЕНИЯ
-# =====================================================
 if [[ $EUID -ne 0 ]]; then
     err "Скрипт должен выполняться от root (sudo)."
     exit 1
@@ -413,7 +393,6 @@ echo "net.ipv6.conf.all.disable_ipv6=1" >> /etc/sysctl.d/99-amnezia.conf 2>/dev/
 echo "net.ipv6.conf.default.disable_ipv6=1" >> /etc/sysctl.d/99-amnezia.conf 2>/dev/null || true
 ok "IP-форвардинг включён, IPv6 отключён"
 
-# Определяем VPN подсеть для будущего использования
 VPN_SUBNET=$(get_vpn_subnet)
 info "Определена VPN подсеть: $VPN_SUBNET"
 
@@ -480,6 +459,6 @@ info "Порты AmneziaVPN (UDP): ${VALID_PORTS[*]}"
 info "VPN подсеть: $VPN_SUBNET"
 
 external_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
-echo -e "\n${YELLOW}️ ВАЖНО: Не закрывайте текущую сессию!${NC}"
+echo -e "\n${YELLOW}⚠️ ВАЖНО: Не закрывайте текущую сессию!${NC}"
 echo -e "Проверьте подключение: ${CYAN}ssh -p $SSH_PORT -i /путь/до/ключа root@${external_ip:-<ваш-IP>}${NC}"
 echo -e "\n${BOLD}Для изменения настроек в будущем просто запустите этот же скрипт снова.${NC}"
