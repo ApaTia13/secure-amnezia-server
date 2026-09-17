@@ -14,7 +14,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CY
 ok()    { echo -e "${GREEN}✓${NC} $1"; }
 warn()  { echo -e "${YELLOW}⚠${NC} $1"; }
 err()   { echo -e "${RED}✗${NC} $1"; }
-info()  { echo -e "${CYAN}➜${NC} $1"; }
+info()  { echo -e "${CYAN}${NC} $1"; }
 title() { echo -e "\n${BOLD}${BLUE}=== $1 ===${NC}\n"; }
 success_banner() { echo -e "${GREEN}${BOLD}✅ $1${NC}"; }
 
@@ -26,6 +26,7 @@ save_config() {
 SSH_PORT="${SSH_PORT:-22}"
 VALID_PORTS="${VALID_PORTS[*]:-}"
 EXTRA_PORTS="${EXTRA_PORTS[*]:-}"
+VPN_SUBNET="${VPN_SUBNET:-}"
 LAST_RUN="$(date +%s)"
 EOF
     chmod 600 "$CONFIG_MARKER"
@@ -54,10 +55,36 @@ show_amnezia_ports() {
     fi
 }
 
-# Функция для получения VPN подсети (для фильтрации по Source IP)
-get_vpn_subnets() {
-    # Ищем подсети на интерфейсах amn* и wg*
-    ip -4 -o addr show | grep -E 'amn|wg' | awk '{print $4}' | tr '\n' ', ' | sed 's/,$//'
+# Функция для получения VPN подсети
+get_vpn_subnet() {
+    # Ищем IP-адрес на интерфейсах amn* или wg* и определяем подсеть
+    local vpn_ip
+    vpn_ip=$(ip -4 -o addr show | grep -E 'amn|wg' | awk '{print $4}' | head -1)
+    
+    if [[ -n "$vpn_ip" ]]; then
+        # Преобразуем IP/маска в подсеть (например, 10.8.0.1/24 -> 10.8.0.0/24)
+        local ip_part="${vpn_ip%/*}"
+        local mask_part="${vpn_ip#*/}"
+        
+        if [[ "$mask_part" =~ ^[0-9]+$ ]]; then
+            # CIDR маска
+            local mask=$(( 0xFFFFFFFF << (32 - mask_part) & 0xFFFFFFFF ))
+            local ip_int=$(( (10#${ip_part//./ })))
+            # Упрощенно: берем первые 3 октета для /24
+            if [[ "$mask_part" -eq 24 ]]; then
+                echo "${ip_part%.*}.0/24"
+            elif [[ "$mask_part" -eq 16 ]]; then
+                echo "${ip_part%.*.*}.0.0/16"
+            else
+                echo "$vpn_ip"
+            fi
+        else
+            echo "$vpn_ip"
+        fi
+    else
+        # Fallback: стандартные VPN-подсети
+        echo "10.8.0.0/24"
+    fi
 }
 
 generate_nftables_config() {
@@ -67,12 +94,8 @@ generate_nftables_config() {
     ext_if=$(ip -4 route show default | awk '{print $5; exit}')
     ext_if=${ext_if:-eth0}
     
-    local vpn_subnets
-    vpn_subnets=$(get_vpn_subnets)
-    # Если не нашли специфичных, добавляем стандартные VPN-диапазоны как fallback
-    if [[ -z "$vpn_subnets" ]]; then
-        vpn_subnets="10.8.0.0/8, 10.9.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
-    fi
+    # Получаем VPN подсеть
+    local vpn_subnet="${VPN_SUBNET:-$(get_vpn_subnet)}"
     
     local tmp_nft
     tmp_nft=$(mktemp)
@@ -99,6 +122,7 @@ EOF
             local scope="${port_entry%%:*}"
             local rule_data="${port_entry#*:}"
             
+            # Обратная совместимость
             if [[ "$scope" != "pub" && "$scope" != "vpn" ]]; then
                 scope="pub"
                 rule_data="$port_entry"
@@ -108,8 +132,8 @@ EOF
             local p_proto="${rule_data#*/}"
             
             if [[ "$scope" == "vpn" ]]; then
-                # Разрешаем ТОЛЬКО если Source IP принадлежит VPN-подсети
-                echo "        ip saddr { $vpn_subnets } $p_proto dport $p_num accept" >> "$tmp_nft"
+                # ДВОЙНАЯ ЗАЩИТА: интерфейс VPN + IP из VPN-подсети
+                echo "        iifname { \"amn*\", \"wg*\" } ip saddr $vpn_subnet $p_proto dport $p_num accept" >> "$tmp_nft"
             else
                 # Публичный доступ
                 echo "        $p_proto dport $p_num accept" >> "$tmp_nft"
@@ -168,6 +192,7 @@ main_menu() {
     echo "  SSH порт: ${SSH_PORT:-22}"
     [[ -n "${VALID_PORTS:-}" ]] && echo "  VPN порты (UDP): ${VALID_PORTS}"
     [[ -n "${EXTRA_PORTS:-}" ]] && echo "  Доп. порты: ${EXTRA_PORTS}"
+    [[ -n "${VPN_SUBNET:-}" ]] && echo "  VPN подсеть: ${VPN_SUBNET}"
     echo ""
     echo "1) Изменить SSH-ключ"
     echo "2) Изменить порт SSH"
@@ -216,18 +241,24 @@ main_menu() {
                 else
                     echo "Где должен быть доступен этот порт?"
                     echo "  1) В интернете (публичный доступ, как SSH)"
-                    echo "  2) Только для клиентов VPN (фильтрация по Source IP)"
+                    echo "  2) ТОЛЬКО через VPN-туннель (фильтр по интерфейсу + IP подсети)"
                     read -rp "Ваш выбор (1-2, по умолчанию 1): " scope_choice
                     
                     local scope="pub"
                     [[ "$scope_choice" == "2" ]] && scope="vpn"
+                    
+                    # Если VPN подсеть не задана, определяем её
+                    if [[ "$scope" == "vpn" && -z "${VPN_SUBNET:-}" ]]; then
+                        VPN_SUBNET=$(get_vpn_subnet)
+                        info "Определена VPN подсеть: $VPN_SUBNET"
+                    fi
                     
                     EXTRA_PORTS="${EXTRA_PORTS:-} ${scope}:${new_p}"
                     generate_nftables_config
                     save_config
                     
                     if [[ "$scope" == "vpn" ]]; then
-                        ok "Порт $new_p добавлен (доступен ТОЛЬКО с VPN-IP)"
+                        ok "Порт $new_p добавлен (доступен ТОЛЬКО через VPN с IP из $VPN_SUBNET)"
                     else
                         ok "Порт $new_p добавлен (публичный доступ)"
                     fi
@@ -382,6 +413,10 @@ echo "net.ipv6.conf.all.disable_ipv6=1" >> /etc/sysctl.d/99-amnezia.conf 2>/dev/
 echo "net.ipv6.conf.default.disable_ipv6=1" >> /etc/sysctl.d/99-amnezia.conf 2>/dev/null || true
 ok "IP-форвардинг включён, IPv6 отключён"
 
+# Определяем VPN подсеть для будущего использования
+VPN_SUBNET=$(get_vpn_subnet)
+info "Определена VPN подсеть: $VPN_SUBNET"
+
 title "4. ОТКЛЮЧЕНИЕ СЕРВИСОВ"
 for svc in cups avahi-daemon ModemManager whoopsie kerneloops bluetooth multipathd; do
     systemctl disable --now "$svc" 2>/dev/null || true
@@ -442,8 +477,9 @@ title "ГОТОВО"
 success_banner "Скрипт безопасной настройки успешно завершён"
 info "Порт SSH: $SSH_PORT"
 info "Порты AmneziaVPN (UDP): ${VALID_PORTS[*]}"
+info "VPN подсеть: $VPN_SUBNET"
 
 external_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
-echo -e "\n${YELLOW}⚠️ ВАЖНО: Не закрывайте текущую сессию!${NC}"
+echo -e "\n${YELLOW}️ ВАЖНО: Не закрывайте текущую сессию!${NC}"
 echo -e "Проверьте подключение: ${CYAN}ssh -p $SSH_PORT -i /путь/до/ключа root@${external_ip:-<ваш-IP>}${NC}"
 echo -e "\n${BOLD}Для изменения настроек в будущем просто запустите этот же скрипт снова.${NC}"
