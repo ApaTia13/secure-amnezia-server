@@ -7,7 +7,6 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export TERM=xterm
 
-# Предварительная настройка keyboard-configuration (чтобы не спрашивал)
 if command -v debconf-set-selections &>/dev/null; then
     echo "keyboard-configuration keyboard-configuration/xkb-keymap select us" | debconf-set-selections 2>/dev/null || true
     echo "keyboard-configuration keyboard-configuration/layout select USA" | debconf-set-selections 2>/dev/null || true
@@ -25,11 +24,36 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 ok()    { echo -e "${GREEN}✓${NC} $1"; }
-warn()  { echo -e "${YELLOW}⚠${NC} $1"; }
+warn()  { echo -e "${YELLOW}${NC} $1"; }
 err()   { echo -e "${RED}✗${NC} $1"; }
 info()  { echo -e "${CYAN}➜${NC} $1"; }
 title() { echo -e "\n${BOLD}${BLUE}=== $1 ===${NC}\n"; }
 success_banner() { echo -e "${GREEN}${BOLD}✅ $1${NC}"; }
+
+# =====================================================
+# Маркер повторного запуска
+# =====================================================
+CONFIG_MARKER="/root/.server-hardening.conf"
+
+save_config() {
+    cat > "$CONFIG_MARKER" <<EOF
+# Сконфигурировано: $(date)
+SSH_PORT=$SSH_PORT
+VPN_PORTS=${VALID_PORTS[*]}
+EXTRA_PORTS=${EXTRA_PORTS[*]:-}
+SSH_KEY_FINGERPRINT=$(ssh-keygen -lf /root/.ssh/authorized_keys 2>/dev/null | head -1 | awk '{print $2}')
+LAST_RUN=$(date +%s)
+EOF
+    chmod 600 "$CONFIG_MARKER"
+}
+
+load_config() {
+    if [[ -f "$CONFIG_MARKER" ]]; then
+        source "$CONFIG_MARKER"
+        return 0
+    fi
+    return 1
+}
 
 # =====================================================
 # Проверка прав root
@@ -115,7 +139,6 @@ fi
 if command -v iptables &>/dev/null && iptables --version 2>/dev/null | grep -qi legacy; then
     warn "Docker использует iptables-legacy, а не nftables-бэкенд."
     warn "Это значит, что наши nftables-правила НЕ влияют на Docker-трафик."
-    warn "VPN может работать, но файервол не блокирует Docker-трафик."
     warn "Рекомендуется переключить Docker на nftables-бэкенд:"
     warn "  update-alternatives --set iptables /usr/sbin/iptables-nft"
     warn "  systemctl restart docker"
@@ -140,6 +163,449 @@ show_amnezia_ports() {
         done
     fi
 }
+
+# =====================================================
+# Функция: показать текущие открытые порты
+# =====================================================
+show_current_ports() {
+    echo -e "\n${CYAN} Текущая конфигурация:${NC}"
+    echo "   SSH порт: ${SSH_PORT:-22}"
+    if [[ -n "${VPN_PORTS:-}" ]]; then
+        echo "   VPN порты (UDP): ${VPN_PORTS[*]}"
+    fi
+    if [[ -n "${EXTRA_PORTS:-}" ]]; then
+        echo "   Дополнительные порты: ${EXTRA_PORTS[*]}"
+    fi
+    echo ""
+}
+
+# =====================================================
+# Функция: переприменить правила firewall
+# =====================================================
+reapply_firewall() {
+    title "ПЕРЕПРИМЕНЕНИЕ ПРАВИЛ FIREWALL"
+    
+    if [[ ! -f /etc/nftables.conf ]]; then
+        err "Файл /etc/nftables.conf не найден!"
+        return 1
+    fi
+    
+    info "Валидация конфига..."
+    if ! nft -c -f /etc/nftables.conf; then
+        err "Ошибка в конфиге nftables!"
+        return 1
+    fi
+    
+    info "Удаляем старые таблицы..."
+    nft delete table inet filter 2>/dev/null || true
+    nft delete table inet nat 2>/dev/null || true
+    
+    info "Применяем правила..."
+    nft -f /etc/nftables.conf
+    ok "Правила firewall переприменены"
+    
+    info "Перезапуск fail2ban..."
+    systemctl restart fail2ban 2>/dev/null || true
+    ok "fail2ban перезапущен"
+    
+    success_banner "Firewall перенастроен"
+}
+
+# =====================================================
+# Функция: отключить защиту (полный rollback)
+# =====================================================
+disable_protection() {
+    title "ОТКЛЮЧЕНИЕ ЗАЩИТЫ"
+    
+    warn "ВНИМАНИЕ! Это действие:"
+    warn "  • Вернёт SSH на порт 22 с парольной аутентификацией"
+    warn "  • Удалит все правила nftables"
+    warn "  • Включит IPv6 обратно"
+    warn "  • Отключит fail2ban"
+    echo ""
+    
+    read -rp "Вы уверены? Это отключит всю защиту сервера! [y/N]: " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        info "Отмена"
+        return 0
+    fi
+    
+    info "Возвращаем SSH конфиг..."
+    if [[ -f /etc/ssh/sshd_config.bak.* ]]; then
+        local backup
+        backup=$(ls -t /etc/ssh/sshd_config.bak.* | head -1)
+        cp "$backup" /etc/ssh/sshd_config
+        ok "Восстановлен из $backup"
+    else
+        warn "Резервная копия SSH не найдена, настраиваем вручную"
+        sed -i 's/^Port .*/Port 22/' /etc/ssh/sshd_config
+        sed -i 's/^PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
+        sed -i 's/^PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        sed -i '/^AllowUsers/d' /etc/ssh/sshd_config
+    fi
+    systemctl restart ssh
+    ok "SSH восстановлен"
+    
+    info "Удаляем правила nftables..."
+    nft delete table inet filter 2>/dev/null || true
+    nft delete table inet nat 2>/dev/null || true
+    rm -f /etc/nftables.conf
+    systemctl disable nftables 2>/dev/null || true
+    ok "nftables отключён"
+    
+    info "Включаем IPv6..."
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+    sed -i '/disable_ipv6/d' /etc/sysctl.d/99-amnezia.conf 2>/dev/null || true
+    ok "IPv6 включён"
+    
+    info "Отключаем fail2ban..."
+    systemctl stop fail2ban 2>/dev/null || true
+    systemctl disable fail2ban 2>/dev/null || true
+    ok "fail2ban отключён"
+    
+    info "Удаляем drop-in Docker..."
+    rm -f /etc/systemd/system/docker.service.d/10-after-nftables.conf
+    systemctl daemon-reload 2>/dev/null || true
+    ok "Drop-in Docker удалён"
+    
+    info "Удаляем маркер конфигурации..."
+    rm -f "$CONFIG_MARKER"
+    ok "Маркер удалён"
+    
+    success_banner "Защита полностью отключена. Сервер вернулся в исходное состояние."
+    warn "Рекомендуется перезагрузить сервер: reboot"
+}
+
+# =====================================================
+# Функция: изменить SSH-ключ
+# =====================================================
+change_ssh_key() {
+    title "ИЗМЕНЕНИЕ SSH-КЛЮЧА"
+    
+    info "Текущий ключ (fingerprint):"
+    ssh-keygen -lf /root/.ssh/authorized_keys 2>/dev/null || warn "Ключ не найден"
+    echo ""
+    
+    echo -e "${YELLOW}${BOLD}ВАЖНО:${NC} Убедитесь, что вставляете правильный публичный ключ."
+    echo "Если ключ обрезан — доступ будет потерян."
+    echo ""
+    
+    while true; do
+        read -rp "Вставьте новый публичный SSH-ключ: " NEW_SSH_KEY
+        if [[ -z "$NEW_SSH_KEY" ]]; then
+            err "Ключ не может быть пустым"
+            continue
+        fi
+        TMP_KEY_FILE=$(mktemp)
+        echo "$NEW_SSH_KEY" > "$TMP_KEY_FILE"
+        if ssh-keygen -lf "$TMP_KEY_FILE" >/dev/null 2>&1; then
+            rm -f "$TMP_KEY_FILE"
+            break
+        else
+            err "Невалидный ключ. Проверьте, не обрезался ли он."
+            rm -f "$TMP_KEY_FILE"
+        fi
+    done
+    
+    # Заменяем ключ полностью
+    echo "$NEW_SSH_KEY" > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    ok "SSH-ключ заменён"
+    
+    # Обновляем fingerprint в маркере
+    if load_config; then
+        save_config
+    fi
+    
+    success_banner "SSH-ключ обновлён"
+}
+
+# =====================================================
+# Функция: изменить порт SSH
+# =====================================================
+change_ssh_port() {
+    title "ИЗМЕНЕНИЕ ПОРТА SSH"
+    
+    info "Текущий порт SSH: ${SSH_PORT:-22}"
+    echo ""
+    
+    while true; do
+        read -rp "Новый порт SSH (по умолчанию 22): " NEW_SSH_PORT
+        NEW_SSH_PORT=${NEW_SSH_PORT:-22}
+        if [[ "$NEW_SSH_PORT" =~ ^[0-9]+$ ]] && [ "$NEW_SSH_PORT" -ge 1 ] && [ "$NEW_SSH_PORT" -le 65535 ]; then
+            break
+        else
+            err "Введите число от 1 до 65535"
+        fi
+    done
+    
+    if [[ "$NEW_SSH_PORT" != "${SSH_PORT:-22}" ]]; then
+        info "Устанавливаем порт $NEW_SSH_PORT..."
+        sed -i "s/^Port .*/Port $NEW_SSH_PORT/" /etc/ssh/sshd_config
+        grep -q "^Port " /etc/ssh/sshd_config || echo "Port $NEW_SSH_PORT" >> /etc/ssh/sshd_config
+        
+        info "Проверка конфигурации..."
+        if ! sshd -t; then
+            err "Ошибка в конфигурации SSH!"
+            return 1
+        fi
+        
+        systemctl restart ssh
+        sleep 2
+        
+        if ss -tlnH "sport = :$NEW_SSH_PORT" 2>/dev/null | grep -q LISTEN; then
+            ok "SSH теперь слушает порт $NEW_SSH_PORT"
+            SSH_PORT=$NEW_SSH_PORT
+            save_config
+            success_banner "Порт SSH изменён на $NEW_SSH_PORT"
+        else
+            warn "Порт $NEW_SSH_PORT не обнаружен. Проверьте: ss -tlnp | grep :$NEW_SSH_PORT"
+        fi
+    else
+        info "Порт не изменился"
+    fi
+}
+
+# =====================================================
+# Функция: управление портами firewall
+# =====================================================
+manage_ports() {
+    title "УПРАВЛЕНИЕ ПОРТАМИ FIREWALL"
+    
+    show_current_ports
+    
+    echo "Выберите действие:"
+    echo "  1) Добавить порт"
+    echo "  2) Удалить порт"
+    echo "  3) Назад"
+    echo ""
+    
+    read -rp "Ваш выбор: " PORT_ACTION
+    
+    case "$PORT_ACTION" in
+        1)
+            echo ""
+            echo "Тип порта:"
+            echo "  1) UDP (для VPN, игр)"
+            echo "  2) TCP (для web-серверов, SSH)"
+            echo ""
+            read -rp "Выберите тип (1-2): " PORT_TYPE
+            
+            case "$PORT_TYPE" in
+                1) PROTO="udp" ;;
+                2) PROTO="tcp" ;;
+                *) err "Неверный выбор"; return 1 ;;
+            esac
+            
+            read -rp "Введите номер порта: " NEW_PORT
+            
+            if [[ ! "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
+                err "Некорректный порт"
+                return 1
+            fi
+            
+            # Проверяем, не занят ли порт
+            if ss -tlnH "sport = :$NEW_PORT" 2>/dev/null | grep -q LISTEN; then
+                warn "Порт $NEW_PORT уже используется"
+                read -rp "Всё равно добавить в firewall? [y/N]: " FORCE
+                [[ "$FORCE" =~ ^[Yy]$ ]] || return 1
+            fi
+            
+            # Добавляем в EXTRA_PORTS
+            EXTRA_PORTS=(${EXTRA_PORTS[*]:-} "$NEW_PORT/$PROTO")
+            
+            # Пересобираем конфиг nftables
+            generate_nftables_config
+            
+            save_config
+            ok "Порт $NEW_PORT/$PROTO добавлен"
+            success_banner "Правила firewall обновлены"
+            ;;
+        2)
+            echo ""
+            echo "Текущие дополнительные порты:"
+            if [[ ${#EXTRA_PORTS[@]} -eq 0 ]]; then
+                info "Нет дополнительных портов"
+                return 0
+            fi
+            
+            for i in "${!EXTRA_PORTS[@]}"; do
+                echo "  $((i+1))) ${EXTRA_PORTS[$i]}"
+            done
+            echo "  0) Отмена"
+            echo ""
+            
+            read -rp "Выберите порт для удаления: " DEL_PORT
+            
+            if [[ "$DEL_PORT" -gt 0 ]] && [[ "$DEL_PORT" -le ${#EXTRA_PORTS[@]} ]]; then
+                unset 'EXTRA_PORTS[$((DEL_PORT-1))]'
+                EXTRA_PORTS=("${EXTRA_PORTS[@]}")
+                
+                generate_nftables_config
+                save_config
+                ok "Порт удалён"
+                success_banner "Правила firewall обновлены"
+            else
+                info "Отмена"
+            fi
+            ;;
+        3)
+            return 0
+            ;;
+        *)
+            err "Неверный выбор"
+            ;;
+    esac
+}
+
+# =====================================================
+# Функция: генерация конфига nftables
+# =====================================================
+generate_nftables_config() {
+    info "Генерация конфига nftables..."
+    
+    EXT_IF=$(ip -4 route show default | awk '{print $5; exit}')
+    if [[ -z "$EXT_IF" ]]; then
+        EXT_IF="eth0"
+    fi
+    
+    TMP_NFT=$(mktemp)
+    cat > "$TMP_NFT" <<EOF
+#!/usr/sbin/nft -f
+# Сгенерировано: $(date)
+# НЕ добавляйте "flush ruleset" — это сломает Docker!
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        iif lo accept
+        ct state established,related accept
+        ct state invalid drop
+
+        tcp dport $SSH_PORT accept
+EOF
+
+    # Добавляем VPN порты (UDP)
+    if [[ -n "${VPN_PORTS:-}" ]]; then
+        for port in "${VPN_PORTS[@]}"; do
+            echo "        udp dport $port accept" >> "$TMP_NFT"
+        done
+    fi
+    
+    # Добавляем дополнительные порты
+    if [[ -n "${EXTRA_PORTS:-}" ]]; then
+        for port_entry in "${EXTRA_PORTS[@]}"; do
+            local port_num="${port_entry%/*}"
+            local port_proto="${port_entry#*/}"
+            echo "        $port_proto dport $port_num accept" >> "$TMP_NFT"
+        done
+    fi
+    
+    cat >> "$TMP_NFT" <<EOF
+
+        ip protocol icmp accept
+
+        limit rate 5/minute log prefix "nft-input-drop: "
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+
+        ct state established,related accept
+        ct state invalid drop
+
+        iifname "wg*" accept
+        oifname "wg*" accept
+        iifname "amn*" accept
+        oifname "amn*" accept
+
+        iifname "docker0" accept
+        oifname "docker0" accept
+        iifname "br-*" accept
+        oifname "br-*" accept
+
+        limit rate 5/minute log prefix "nft-forward-drop: "
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+
+table inet nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname "$EXT_IF" masquerade
+    }
+}
+EOF
+
+    if ! nft -c -f "$TMP_NFT"; then
+        err "Ошибка в конфиге nftables!"
+        rm -f "$TMP_NFT"
+        return 1
+    fi
+    
+    mv "$TMP_NFT" /etc/nftables.conf
+    chmod 644 /etc/nftables.conf
+    
+    nft delete table inet filter 2>/dev/null || true
+    nft delete table inet nat 2>/dev/null || true
+    nft -f /etc/nftables.conf
+    
+    ok "Правила nftables применены"
+}
+
+# =====================================================
+# Главное меню (для повторного запуска)
+# =====================================================
+main_menu() {
+    title "УПРАВЛЕНИЕ ЗАЩИТОЙ СЕРВЕРА"
+    
+    show_current_ports
+    
+    echo "Выберите действие:"
+    echo "  1) Изменить SSH-ключ"
+    echo "  2) Изменить порт SSH"
+    echo "  3) Управление портами firewall (добавить/удалить)"
+    echo "  4) Переприменить правила firewall"
+    echo "  5) Отключить защиту (полный rollback)"
+    echo "  6) Выйти"
+    echo ""
+    
+    read -rp "Ваш выбор (1-6): " MENU_CHOICE
+    
+    case "$MENU_CHOICE" in
+        1) change_ssh_key ;;
+        2) change_ssh_port ;;
+        3) manage_ports ;;
+        4) reapply_firewall ;;
+        5) disable_protection ;;
+        6) 
+            info "Выход"
+            exit 0
+            ;;
+        *)
+            err "Неверный выбор"
+            exit 1
+            ;;
+    esac
+}
+
+# =====================================================
+# Проверка: скрипт уже запускался?
+# =====================================================
+if load_config; then
+    info "Обнаружена предыдущая конфигурация (последний запуск: $(date -d @$LAST_RUN 2>/dev/null || echo 'неизвестно'))"
+    main_menu
+    exit 0
+fi
+
+# =====================================================
+# ПЕРВЫЙ ЗАПУСК: полная настройка
+# =====================================================
 
 # =====================================================
 # 1. Настройка SSH-ключа для root
@@ -186,8 +652,6 @@ SSH_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)-$$"
 cp /etc/ssh/sshd_config "$SSH_BACKUP"
 ok "Резервная копия конфига SSH: $SSH_BACKUP"
 
-# Получаем текущий порт sshd для исключения из проверки занятости
-# Защита от падения sshd -T (set -e + pipefail)
 CURRENT_SSH_PORT=22
 if command -v sshd &>/dev/null; then
     CURRENT_SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}') || true
@@ -415,103 +879,15 @@ if [ ${#VALID_PORTS[@]} -eq 0 ]; then
     exit 1
 fi
 
+# Инициализируем EXTRA_PORTS
+EXTRA_PORTS=()
+
 BACKUP_NFT="/etc/nftables-backup-$(date +%Y%m%d%H%M%S)-$$.nft"
 nft list ruleset > "$BACKUP_NFT" 2>/dev/null || true
 ok "Резервная копия текущего состояния nftables: $BACKUP_NFT"
 
-EXT_IF=$(ip -4 route show default | awk '{print $5; exit}')
-if [[ -z "$EXT_IF" ]]; then
-    warn "Не удалось определить внешний интерфейс, masquerade может не работать"
-    EXT_IF="eth0"
-else
-    ok "Внешний интерфейс: $EXT_IF"
-fi
+generate_nftables_config
 
-NFT_FILE="/etc/nftables.conf"
-
-NFT_CONF_BACKUP=""
-if [[ -f "$NFT_FILE" ]]; then
-    NFT_CONF_BACKUP="/etc/nftables.conf.bak.$(date +%Y%m%d%H%M%S)-$$"
-    cp "$NFT_FILE" "$NFT_CONF_BACKUP"
-    ok "Резервная копия предыдущего $NFT_FILE: $NFT_CONF_BACKUP"
-fi
-
-TMP_NFT=$(mktemp)
-cat > "$TMP_NFT" <<EOF
-#!/usr/sbin/nft -f
-#
-# ВАЖНО: здесь намеренно нет "flush ruleset" — на сервере с Docker это
-# сносит таблицы Docker (ip filter / ip nat / ip docker-bridges) и Docker
-# не восстанавливает их сам.
-
-table inet filter {
-    chain input {
-        type filter hook input priority 0; policy drop;
-
-        iif lo accept
-        ct state established,related accept
-        ct state invalid drop
-
-        tcp dport $SSH_PORT accept
-EOF
-
-for port in "${VALID_PORTS[@]}"; do
-    echo "        udp dport $port accept" >> "$TMP_NFT"
-done
-
-cat >> "$TMP_NFT" <<EOF
-
-        ip protocol icmp accept
-
-        limit rate 5/minute log prefix "nft-input-drop: "
-    }
-
-    chain forward {
-        type filter hook forward priority 0; policy drop;
-
-        ct state established,related accept
-        ct state invalid drop
-
-        iifname "wg*" accept
-        oifname "wg*" accept
-        iifname "amn*" accept
-        oifname "amn*" accept
-
-        iifname "docker0" accept
-        oifname "docker0" accept
-        iifname "br-*" accept
-        oifname "br-*" accept
-
-        limit rate 5/minute log prefix "nft-forward-drop: "
-    }
-
-    chain output {
-        type filter hook output priority 0; policy accept;
-    }
-}
-
-table inet nat {
-    chain postrouting {
-        type nat hook postrouting priority 100; policy accept;
-        oifname "$EXT_IF" masquerade
-    }
-}
-EOF
-
-if ! nft -c -f "$TMP_NFT"; then
-    err "Ошибка в сгенерированном конфиге nftables — НЕ применяем."
-    rm -f "$TMP_NFT"
-    exit 1
-fi
-
-mv "$TMP_NFT" "$NFT_FILE"
-chmod 644 "$NFT_FILE"
-
-info "Удаляем прошлые версии НАШИХ таблиц (если есть), не трогая таблицы Docker..."
-nft delete table inet filter 2>/dev/null || true
-nft delete table inet nat 2>/dev/null || true
-
-nft -f "$NFT_FILE"
 systemctl enable --quiet nftables
 ok "Файервол nftables с NAT применён (таблицы Docker не затронуты)"
 
@@ -615,6 +991,11 @@ else
 fi
 
 # =====================================================
+# Сохраняем конфигурацию
+# =====================================================
+save_config
+
+# =====================================================
 # Финальная информация
 # =====================================================
 title "ГОТОВО"
@@ -649,23 +1030,10 @@ echo ""
 echo -e "${YELLOW}2. Снести наши таблицы nftables из памяти (Docker не трогаем):${NC}"
 echo -e "   ${CYAN}nft delete table inet filter 2>/dev/null; nft delete table inet nat 2>/dev/null${NC}"
 echo ""
-if [[ -n "$NFT_CONF_BACKUP" && -f "$NFT_CONF_BACKUP" ]]; then
-    echo -e "${YELLOW}3. Восстановить прежний /etc/nftables.conf:${NC}"
-    echo -e "   ${CYAN}cp $NFT_CONF_BACKUP /etc/nftables.conf${NC}"
-else
-    echo -e "${YELLOW}3. Удалить наш /etc/nftables.conf и отключить nftables.service:${NC}"
-    echo -e "   ${CYAN}rm -f /etc/nftables.conf && systemctl disable nftables${NC}"
-fi
+echo -e "${YELLOW}3. Удалить наш /etc/nftables.conf и отключить nftables.service:${NC}"
+echo -e "   ${CYAN}rm -f /etc/nftables.conf && systemctl disable nftables${NC}"
 echo ""
-if [[ -n "$SYSCTL_BACKUP" && -f "$SYSCTL_BACKUP" ]]; then
-    echo -e "${YELLOW}4. Восстановить прежний $SYSCTL_CONF:${NC}"
-    echo -e "   ${CYAN}cp $SYSCTL_BACKUP $SYSCTL_CONF && sysctl --system${NC}"
-else
-    echo -e "${YELLOW}4. Удалить наш $SYSCTL_CONF:${NC}"
-    echo -e "   ${CYAN}rm -f $SYSCTL_CONF && sysctl --system${NC}"
-fi
-echo ""
-echo -e "${YELLOW}5. Удалить drop-in Docker (если был создан):${NC}"
+echo -e "${YELLOW}4. Удалить drop-in Docker (если был создан):${NC}"
 echo -e "   ${CYAN}rm -f /etc/systemd/system/docker.service.d/10-after-nftables.conf && systemctl daemon-reload${NC}"
 echo ""
 
@@ -677,6 +1045,10 @@ echo -e "  ${CYAN}nft list table ip nat | head -20${NC}"
 echo -e "  ${CYAN}ss -tlnp | grep :$SSH_PORT${NC}"
 echo ""
 
+echo -e "${BOLD}=== ПОВТОРНЫЙ ЗАПУСК ===${NC}"
+info "При повторном запуске скрипта будет показано меню управления:"
+echo -e "  ${CYAN}bash $0${NC}"
+echo ""
 echo -e "${BOLD}=== ПОЛЕЗНЫЕ ПРОВЕРКИ ===${NC}"
 info "Правила Docker целы:     nft list table ip nat"
 info "Наши правила:            nft list table inet filter; nft list table inet nat"
