@@ -2,6 +2,18 @@
 set -euo pipefail
 
 # =====================================================
+# Делаем все apt-операции неинтерактивными
+# =====================================================
+export DEBIAN_FRONTEND=noninteractive
+export TERM=xterm
+
+# Предварительная настройка keyboard-configuration (чтобы не спрашивал)
+if command -v debconf-set-selections &>/dev/null; then
+    echo "keyboard-configuration keyboard-configuration/xkb-keymap select us" | debconf-set-selections 2>/dev/null || true
+    echo "keyboard-configuration keyboard-configuration/layout select USA" | debconf-set-selections 2>/dev/null || true
+fi
+
+# =====================================================
 # Цветное оформление
 # =====================================================
 RED='\033[0;31m'
@@ -73,10 +85,10 @@ info "Обновление списков пакетов..."
 apt-get update -qq || warn "apt update завершился с предупреждением"
 
 info "Обновление установленных пакетов (это может занять несколько минут)..."
-apt-get upgrade -y -qq || warn "apt upgrade завершился с предупреждением"
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq || warn "apt upgrade завершился с предупреждением"
 
 info "Установка необходимых пакетов для работы скрипта..."
-apt-get install -y -qq \
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     openssh-server \
     openssh-client \
     nftables \
@@ -174,8 +186,14 @@ SSH_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)-$$"
 cp /etc/ssh/sshd_config "$SSH_BACKUP"
 ok "Резервная копия конфига SSH: $SSH_BACKUP"
 
-CURRENT_SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
-CURRENT_SSH_PORT=${CURRENT_SSH_PORT:-22}
+# Получаем текущий порт sshd для исключения из проверки занятости
+# Защита от падения sshd -T (set -e + pipefail)
+CURRENT_SSH_PORT=22
+if command -v sshd &>/dev/null; then
+    CURRENT_SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}') || true
+    CURRENT_SSH_PORT=${CURRENT_SSH_PORT:-22}
+fi
+info "Текущий порт SSH: $CURRENT_SSH_PORT"
 
 while true; do
     read -rp "Новый порт SSH (по умолчанию 22): " SSH_PORT
