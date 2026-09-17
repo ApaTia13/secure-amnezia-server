@@ -35,7 +35,6 @@ success_banner() { echo -e "${GREEN}${BOLD}✅ $1${NC}"; }
 # =====================================================
 CONFIG_MARKER="/root/.server-hardening.conf"
 
-# ФУНКЦИЯ: Сохранить конфиг (ВСЕ переменные в кавычках!)
 save_config() {
     cat > "$CONFIG_MARKER" <<EOF
 # Сконфигурировано: $(date)
@@ -47,7 +46,6 @@ EOF
     chmod 600 "$CONFIG_MARKER"
 }
 
-# ФУНКЦИЯ: Загрузить конфиг
 load_config() {
     if [[ -f "$CONFIG_MARKER" ]]; then
         # shellcheck disable=SC1090
@@ -103,9 +101,26 @@ EOF
     
     if [[ -n "${EXTRA_PORTS:-}" ]]; then
         for port_entry in ${EXTRA_PORTS}; do
-            local p_num="${port_entry%/*}"
-            local p_proto="${port_entry#*/}"
-            echo "        $p_proto dport $p_num accept" >> "$tmp_nft"
+            local scope="${port_entry%%:*}"
+            local rule_data="${port_entry#*:}"
+            
+            # Обратная совместимость: если префикса нет, считаем что это pub
+            if [[ "$scope" != "pub" && "$scope" != "vpn" ]]; then
+                scope="pub"
+                rule_data="$port_entry"
+            fi
+            
+            local p_num="${rule_data%/*}"
+            local p_proto="${rule_data#*/}"
+            
+            if [[ "$scope" == "vpn" ]]; then
+                # Разрешаем только с VPN интерфейсов
+                echo "        iifname \"amn*\" $p_proto dport $p_num accept" >> "$tmp_nft"
+                echo "        iifname \"wg*\" $p_proto dport $p_num accept" >> "$tmp_nft"
+            else
+                # Публичный доступ
+                echo "        $p_proto dport $p_num accept" >> "$tmp_nft"
+            fi
         done
     fi
     
@@ -154,7 +169,7 @@ EOF
     ok "Правила nftables успешно применены"
 }
 
-# ФУНКЦИЯ: Главное меню (ОБЪЯВЛЕНА ДО ИСПОЛЬЗОВАНИЯ)
+# ФУНКЦИЯ: Главное меню
 main_menu() {
     title "УПРАВЛЕНИЕ ЗАЩИТОЙ СЕРВЕРА"
     echo -e "${CYAN}Текущая конфигурация:${NC}"
@@ -203,21 +218,56 @@ main_menu() {
         3)
             read -rp "Добавить (+) или удалить (-) порт? " action
             if [[ "$action" == "+" ]]; then
-                read -rp "Введите порт и протокол (например, 80/tcp): " new_p
-                if [[ "$new_p" =~ ^[0-9]+/(tcp|udp)$ ]]; then
-                    EXTRA_PORTS="${EXTRA_PORTS:-} $new_p"
+                read -rp "Введите порт и протокол (например, 8080/tcp): " new_p
+                if [[ ! "$new_p" =~ ^[0-9]+/(tcp|udp)$ ]]; then
+                    err "Формат должен быть как 8080/tcp или 53/udp"
+                else
+                    echo "Где должен быть доступен этот порт?"
+                    echo "  1) В интернете (публичный доступ, как SSH)"
+                    echo "  2) Только внутри VPN сети (через Amnezia/WireGuard)"
+                    read -rp "Ваш выбор (1-2, по умолчанию 1): " scope_choice
+                    
+                    local scope="pub"
+                    [[ "$scope_choice" == "2" ]] && scope="vpn"
+                    
+                    EXTRA_PORTS="${EXTRA_PORTS:-} ${scope}:${new_p}"
                     generate_nftables_config
                     save_config
-                    ok "Порт $new_p добавлен"
-                else
-                    err "Формат должен быть как 80/tcp или 53/udp"
+                    
+                    if [[ "$scope" == "vpn" ]]; then
+                        ok "Порт $new_p добавлен (доступен ТОЛЬКО через VPN)"
+                    else
+                        ok "Порт $new_p добавлен (публичный доступ)"
+                    fi
                 fi
             elif [[ "$action" == "-" ]]; then
-                read -rp "Какой порт удалить (например, 80/tcp)? " del_p
-                EXTRA_PORTS=$(echo "${EXTRA_PORTS:-}" | sed "s/ *$del_p *//g")
-                generate_nftables_config
-                save_config
-                ok "Порт $del_p удалён"
+                if [[ -z "${EXTRA_PORTS:-}" ]]; then
+                    info "Дополнительных портов нет"
+                else
+                    echo "Текущие дополнительные порты:"
+                    local idx=1
+                    for p in ${EXTRA_PORTS}; do
+                        local display_p="${p#*:}"
+                        local type_p="${p%%:*}"
+                        local type_str="[ПУБЛИЧНЫЙ]"
+                        [[ "$type_p" == "vpn" ]] && type_str="[ТОЛЬКО VPN]"
+                        echo "  $idx) $display_p $type_str"
+                        ((idx++)) || true
+                    done
+                    echo "  0) Отмена"
+                    read -rp "Введите номер порта для удаления: " del_idx
+                    
+                    if [[ "$del_idx" -gt 0 ]] && [[ "$del_idx" -lt "$idx" ]]; then
+                        local ports_arr=(${EXTRA_PORTS})
+                        unset 'ports_arr[$((del_idx-1))]'
+                        EXTRA_PORTS="${ports_arr[*]}"
+                        generate_nftables_config
+                        save_config
+                        ok "Порт удалён"
+                    else
+                        info "Отмена"
+                    fi
+                fi
             fi
             ;;
         4)
@@ -254,18 +304,15 @@ main_menu() {
 # НАЧАЛО ВЫПОЛНЕНИЯ СКРИПТА
 # =====================================================
 
-# 1. Проверка прав root
 if [[ $EUID -ne 0 ]]; then
     err "Скрипт должен выполняться от root (sudo)."
     exit 1
 fi
 
-# 2. Логирование
 LOGFILE="/var/log/server-hardening-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1
 info "Лог этого запуска сохраняется в: $LOGFILE"
 
-# 3. Pre-flight проверка
 title "ПРОВЕРКА НАЛИЧИЯ DOCKER И AMNEZIAVPN"
 if ! command -v docker &>/dev/null; then
     err "Docker не установлен."
@@ -284,16 +331,12 @@ if [[ -z "$AMNEZIA_CONTAINERS" ]]; then
 fi
 ok "Найдены контейнеры AmneziaVPN: $(echo "$AMNEZIA_CONTAINERS" | tr '\n' ' ')"
 
-# 4. ПРОВЕРКА: скрипт уже запускался? (ТЕПЕРЬ ЭТО РАБОТАЕТ, т.к. main_menu уже объявлена)
 if load_config; then
     info "Обнаружена предыдущая конфигурация. Открываю меню управления..."
     main_menu
     exit 0
 fi
 
-# =====================================================
-# ПЕРВЫЙ ЗАПУСК: полная настройка
-# =====================================================
 title "ОБНОВЛЕНИЕ СИСТЕМЫ И УСТАНОВКА ЗАВИСИМОСТЕЙ"
 apt-get update -qq || warn "apt update завершился с предупреждением"
 apt-get upgrade -y -qq || warn "apt upgrade завершился с предупреждением"
