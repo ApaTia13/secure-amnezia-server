@@ -13,7 +13,7 @@ err()   { echo -e "${RED}✗${NC} $1"; }
 info()  { echo -e "${CYAN}➜${NC} $1"; }
 title() { echo -e "\n${BOLD}${BLUE}=== $1 ===${NC}\n"; }
 
-CONFIG_MARKER="/root/.amnezia-hardening.conf"
+CONFIG_MARKER="/etc/amnezia-hardening.conf"
 LOGFILE="/var/log/amnezia-hardening-$(date +%Y%m%d-%H%M%S).log"
 
 exec > >(tee -a "$LOGFILE") 2>&1
@@ -43,14 +43,14 @@ install_docker_inline() {
     info "Обновление пакетов и установка зависимостей..."
     apt-get update -qq
     apt-get install -y -qq curl apt-transport-https ca-certificates software-properties-common
-    
+
     info "Добавление репозитория Docker..."
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    
+
     apt-get update -qq
     apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
-    
+
     systemctl enable --now docker
     ok "Docker успешно установлен и запущен."
 }
@@ -84,8 +84,10 @@ echo "Создание отдельного пользователя может 
 echo -e "${GREEN}Рекомендуемый путь: Оставить root, но максимально его защитить (ключи, порт, fail2ban).${NC}\n"
 
 read -rp "Создать отдельного пользователя 'amnezia' вместо root? (y/N, НЕ РЕКОМЕНДУЕТСЯ): " USE_NON_ROOT
+
 SSH_USER="root"
-if [[ "$USE_NON_ROOT" =~ ^[Yy]$ ]]; then
+
+if [[ "${USE_NON_ROOT:-}" =~ ^[Yy]$ ]]; then
     SSH_USER="amnezia"
     warn "Вы выбрали нестандартный путь. Убедитесь, что ваш клиент Amnezia поддерживает подключение под обычным пользователем."
     useradd -m -s /bin/bash amnezia || true
@@ -119,25 +121,29 @@ ok "Системные настройки применены."
 
 title "НАСТРОЙКА SSH"
 mkdir -p /root/.ssh; chmod 700 /root/.ssh
-if [[ "$SSH_USER" == "amnezia" ]]; then
-    mkdir -p /home/amnezia/.ssh; chmod 700 /home/amnezia/.ssh; chown -R amnezia:amnezia /home/amnezia/.ssh
+
+if [[ "${SSH_USER}" == "amnezia" ]]; then
+    mkdir -p /home/amnezia/.ssh
+    chmod 700 /home/amnezia/.ssh
+    chown -R amnezia:amnezia /home/amnezia/.ssh
 fi
 
 echo -e "${YELLOW}ВАЖНО: Убедитесь, что вставляете ПРАВИЛЬНЫЙ публичный SSH-ключ.${NC}"
 echo "Если вы его потеряете, доступ к серверу будет утрачен без VNC/KVM консоли!"
 while true; do
     read -rp "Вставьте публичный SSH-ключ (одной строкой): " USER_SSH_KEY
-    [[ -z "$USER_SSH_KEY" ]] && { err "Ключ не может быть пустым"; continue; }
+    [[ -z "${USER_SSH_KEY:-}" ]] && { err "Ключ не может быть пустым"; continue; }
     tmp_key=$(mktemp)
     echo "$USER_SSH_KEY" > "$tmp_key"
     if ssh-keygen -lf "$tmp_key" >/dev/null 2>&1; then
         rm -f "$tmp_key"; break
     else
-        err "Невалидный формат ключа. Попробуйте снова."; rm -f "$tmp_key"
+        err "Невалидный формат ключа. Попробуйте снова."
+        rm -f "$tmp_key"
     fi
 done
 
-if [[ "$SSH_USER" == "root" ]]; then
+if [[ "${SSH_USER}" == "root" ]]; then
     echo "$USER_SSH_KEY" > /root/.ssh/authorized_keys
     chmod 600 /root/.ssh/authorized_keys
 else
@@ -151,10 +157,10 @@ current_ssh_port=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || echo 
 info "Текущий порт SSH: ${current_ssh_port}"
 while true; do
     read -rp "Введите новый порт SSH (1-65535, по умолчанию 22): " SSH_PORT
-    SSH_PORT=${SSH_PORT:-22}
-    if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then 
+    SSH_PORT="${SSH_PORT:-22}"
+    if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then
         break
-    else 
+    else
         err "Введите корректное число от 1 до 65535"
     fi
 done
@@ -169,7 +175,7 @@ grep -q "^PasswordAuthentication " /etc/ssh/sshd_config || echo "PasswordAuthent
 sed -i 's/^#*PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 grep -q "^PubkeyAuthentication " /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
 
-if [[ "$SSH_USER" == "amnezia" ]]; then
+if [[ "${SSH_USER}" == "amnezia" ]]; then
     sed -i '/^AllowUsers /d' /etc/ssh/sshd_config
     echo "AllowUsers amnezia" >> /etc/ssh/sshd_config
 else
@@ -182,9 +188,9 @@ systemctl stop ssh.socket 2>/dev/null || true
 systemctl disable ssh.socket 2>/dev/null || true
 systemctl restart ssh
 sleep 2
-if ss -tlnH "sport = :$SSH_PORT" 2>/dev/null | grep -q LISTEN; then 
+if ss -tlnH "sport = :$SSH_PORT" 2>/dev/null | grep -q LISTEN; then
     ok "SSH успешно слушает порт $SSH_PORT"
-else 
+else
     warn "Порт $SSH_PORT не обнаружен как LISTEN. Проверьте настройки."
 fi
 
@@ -226,10 +232,10 @@ title "НАСТРОЙКА ФАЙЕРВОЛА (NFTABLES)"
 
 AUTO_PORTS=$(docker ps --filter "name=amnezia" --format "{{.Ports}}" | tr ',' '\n' | grep 'udp' | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d':' -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
 
-if [[ -n "$AUTO_PORTS" ]]; then
+if [[ -n "${AUTO_PORTS:-}" ]]; then
     info "Автоматически обнаружены UDP-порты Amnezia: $AUTO_PORTS"
     read -rp "Подтвердите порты (нажмите Enter для использования найденных или введите свои): " AMNEZIA_PORTS_RAW
-    AMNEZIA_PORTS_RAW=${AMNEZIA_PORTS_RAW:-$AUTO_PORTS}
+    AMNEZIA_PORTS_RAW="${AMNEZIA_PORTS_RAW:-$AUTO_PORTS}"
 else
     warn "Не удалось автоопределить порты. Введите их вручную."
     read -rp "Введите UDP-порты AmneziaVPN через запятую: " AMNEZIA_PORTS_RAW
@@ -240,7 +246,7 @@ VALID_PORTS=()
 for port in "${PORTS_ARRAY[@]}"; do
     port=$(echo "$port" | xargs)
     if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-        if [[ ! " ${VALID_PORTS[*]} " =~ " ${port} " ]]; then 
+        if [[ ! " ${VALID_PORTS[*]:-} " =~ " ${port} " ]]; then
             VALID_PORTS+=("$port")
         fi
     else
@@ -248,19 +254,20 @@ for port in "${PORTS_ARRAY[@]}"; do
     fi
 done
 
-if [ ${#VALID_PORTS[@]} -eq 0 ]; then 
+if [ ${#VALID_PORTS[@]} -eq 0 ]; then
     err "Не указано ни одного корректного порта. Завершение."
     exit 1
 fi
 
 info "Будут открыты UDP порты: ${VALID_PORTS[*]}"
 read -rp "Все верно? (y/N): " CONFIRM_PORTS
-if [[ ! "$CONFIRM_PORTS" =~ ^[Yy]$ ]]; then
+if [[ ! "${CONFIRM_PORTS:-}" =~ ^[Yy]$ ]]; then
     err "Отменено пользователем."
     exit 1
 fi
 
-nft list ruleset > "/etc/nftables-backup-$(date +%Y%m%d%H%M%S).nft" 2>/dev/null || true
+mkdir -p /var/backups
+nft list ruleset > "/var/backups/nftables-backup-$(date +%Y%m%d%H%M%S).nft" 2>/dev/null || true
 
 mkdir -p /etc/docker
 if [ ! -f /etc/docker/daemon.json ]; then
@@ -276,7 +283,7 @@ EOF
 systemctl daemon-reload
 
 EXT_IF=$(ip -4 route show default | awk '{print $5; exit}')
-EXT_IF=${EXT_IF:-eth0}
+EXT_IF="${EXT_IF:-eth0}"
 
 cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
@@ -333,27 +340,36 @@ title "✅ НАСТРОЙКА ЗАВЕРШЕНА"
 EXTERNAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || echo "ВАШ_IP")
 
 echo -e "${GREEN}${BOLD}Сервер успешно защищен!${NC}"
-echo -e "• Пользователь: ${CYAN}$SSH_USER${NC}"
-echo -e "• SSH Порт: ${CYAN}$SSH_PORT${NC}"
+echo -e "• Пользователь: ${CYAN}${SSH_USER}${NC}"
+echo -e "• SSH Порт: ${CYAN}${SSH_PORT}${NC}"
 echo -e "• VPN Порты (UDP): ${CYAN}${VALID_PORTS[*]}${NC}"
-echo -e "• Внешний IP: ${CYAN}$EXTERNAL_IP${NC}"
+echo -e "• Внешний IP: ${CYAN}${EXTERNAL_IP}${NC}"
 
 echo -e "\n${YELLOW}${BOLD}⚠️ ВАЖНО: НЕ ЗАКРЫВАЙТЕ ЭТОТ ТЕРМИНАЛ СРАЗУ! ⚠️${NC}"
 echo "Откройте НОВОЕ окно терминала и проверьте подключение:"
-echo -e "${CYAN}ssh -p $SSH_PORT -i /путь/до/вашего/приватного/ключа $SSH_USER@$EXTERNAL_IP${NC}"
+echo -e "${CYAN}ssh -p $SSH_PORT -i /путь/до/вашего/приватного/ключа ${SSH_USER}@${EXTERNAL_IP}${NC}"
 
 echo -e "\n${RED}${BOLD}🚨 PANIC BUTTON (ЕСЛИ ВЫ ПОТЕРЯЛИ ДОСТУП): 🚨${NC}"
 echo "1. Зайдите в веб-консоль (VNC/KVM) вашего хостинг-провайдера."
 echo "2. Авторизуйтесь там (обычно логин/пароль от сервера)."
-echo "3. Выполните команду для сброса защиты:"
-echo -e "   ${CYAN}curl -sSL https://raw.githubusercontent.com/ApaTia13/secure-amnezia-server/refs/heads/main/secure-amnezia.sh | sudo bash${NC}"
-echo "   (Затем выберите опцию полного сброса в меню, если она будет добавлена, или вручную верните Port 22 и PasswordAuthentication yes в /etc/ssh/sshd_config)."
+echo "3. Выполните команду для временного возврата входа по паролю:"
+echo -e "   ${CYAN}sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config && systemctl restart ssh${NC}"
+echo "4. Исправьте настройки и снова отключите пароли."
 
 echo -e "\n${BOLD}Для повторного запуска управления просто выполните этот скрипт снова.${NC}"
 
-if [[ -f "$0" && "$0" != "bash" ]]; then
+cat > "$CONFIG_MARKER" <<EOF
+# Сконфигурировано: $(date)
+SSH_USER="${SSH_USER}"
+SSH_PORT="${SSH_PORT}"
+VALID_PORTS="${VALID_PORTS[*]}"
+LAST_RUN="$(date +%s)"
+EOF
+chmod 600 "$CONFIG_MARKER"
+
+if [[ -f "$0" && "$0" != "bash" && "$0" != "/dev/stdin" ]]; then
     read -rp "Удалить файл скрипта '$0' с сервера после выполнения? (y/N): " CLEANUP
-    if [[ "$CLEANUP" =~ ^[Yy]$ ]]; then
+    if [[ "${CLEANUP:-}" =~ ^[Yy]$ ]]; then
         rm -f "$0"
         ok "Файл скрипта удален."
     fi
